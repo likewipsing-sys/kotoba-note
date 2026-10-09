@@ -353,30 +353,128 @@ async function aiJSON(prompt,{signal,onText,quick,images}={}){
     const o={signal,cache:false};if(onText)o.onText=onText;if(quick)o.modelTier="quick";if(images)o.images=images;
     return sample.json(prompt,o);
   }
-  const cfg=geminiCfg();
-  if(!cfg.key) throw {code:"no_key"};
+  return geminiJSON(prompt,{signal,onText,images});
+}
+
+// ---------- Gemini ----------
+const GAPI="https://generativelanguage.googleapis.com/v1beta/models/";
+const GMODE_KEY="kotoba-gemini-auth";
+let THINK_OFF=false;
+function gModeSaved(){try{return localStorage.getItem(GMODE_KEY)}catch(e){return null}}
+function gModeSave(m){try{localStorage.setItem(GMODE_KEY,m)}catch(e){}}
+function gGenCfg(model){
+  const gc={responseMimeType:"application/json",temperature:0.7};
+  if(!THINK_OFF&&/gemini-3|latest/.test(model)) gc.thinkingConfig={thinkingLevel:"low"};
+  return gc;
+}
+// One request. mode "header" sends the key in x-goog-api-key, mode "query" puts it in ?key=.
+// Gives up when nothing arrives for `firstMs` (before the reply starts) or `idleMs` (while it streams).
+async function gAttempt({model,key,mode,parts,signal,onText,firstMs,idleMs,stream}){
+  const ctl=new AbortController();let timedOut=false;let timer=null;
+  const arm=ms=>{clearTimeout(timer);timer=setTimeout(()=>{timedOut=true;ctl.abort()},ms)};
+  const onUser=()=>ctl.abort();if(signal){if(signal.aborted)throw {code:"cancelled"};signal.addEventListener("abort",onUser,{once:true})}
+  const t0=performance.now();const secs=()=>Math.round((performance.now()-t0)/1000);
+  const qs=[];if(stream)qs.push("alt=sse");if(mode==="query")qs.push("key="+encodeURIComponent(key));
+  const url=GAPI+encodeURIComponent(model)+(stream?":streamGenerateContent":":generateContent")+(qs.length?"?"+qs.join("&"):"");
+  const headers={"Content-Type":"application/json"};if(mode==="header")headers["x-goog-api-key"]=key;
+  try{
+    arm(firstMs);
+    let res;
+    try{res=await fetch(url,{method:"POST",headers,signal:ctl.signal,body:JSON.stringify({contents:[{role:"user",parts}],generationConfig:gGenCfg(model)})})}
+    catch(e){
+      if(signal&&signal.aborted)throw {code:"cancelled"};
+      return {kind:timedOut?"timeout":"net",info:timedOut?`${secs()}초 동안 응답 없음`:`연결 실패 (${(e&&e.message)||e})`};
+    }
+    if(!res.ok){
+      clearTimeout(timer);
+      let msg="";try{msg=(await res.json()).error.message||""}catch(e){}
+      return {kind:"http",status:res.status,msg,info:`HTTP ${res.status}${msg?" "+msg.slice(0,120):""}`};
+    }
+    let text="";
+    if(!stream){
+      const j=await res.json();clearTimeout(timer);
+      text=((j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts)||[]).filter(p=>!p.thought).map(p=>p.text||"").join("");
+      return {kind:"ok",text,info:`${secs()}초`};
+    }
+    arm(idleMs);
+    const rd=res.body.getReader();const dec=new TextDecoder();let buf="";
+    for(;;){
+      let r;
+      try{r=await rd.read()}catch(e){
+        if(signal&&signal.aborted)throw {code:"cancelled"};
+        if(text)break;
+        return {kind:timedOut?"timeout":"net",info:timedOut?`${secs()}초 동안 응답 없음`:"응답 도중 연결이 끊김"};
+      }
+      if(r.done)break;
+      arm(idleMs);
+      buf+=dec.decode(r.value,{stream:true});
+      let i;
+      while((i=buf.indexOf("\n\n"))>=0||(i=buf.indexOf("\r\n\r\n"))>=0){
+        const ev=buf.slice(0,i);buf=buf.slice(i+(buf[i]==="\r"?4:2));
+        for(const line of ev.split(/\r?\n/)){
+          if(!line.startsWith("data:"))continue;
+          let j;try{j=JSON.parse(line.slice(5).trim())}catch(e){continue}
+          if(j.error)return {kind:"http",status:j.error.code||500,msg:j.error.message||"",info:`오류 ${j.error.message||""}`};
+          const ps=(j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts)||[];
+          const add=ps.filter(p=>!p.thought).map(p=>p.text||"").join("");
+          if(add){text+=add;if(onText)onText({text,delta:add})}
+        }
+      }
+    }
+    clearTimeout(timer);
+    return {kind:"ok",text,info:`${secs()}초`};
+  }finally{clearTimeout(timer);if(signal)signal.removeEventListener("abort",onUser)}
+}
+async function geminiJSON(prompt,{signal,onText,images}={}){
+  const cfg=geminiCfg();const key=(cfg.key||"").trim();
+  if(!key) throw {code:"no_key"};
+  if(navigator.onLine===false) throw {code:"offline"};
+  const model=(cfg.model||GDEF).trim();
   const parts=[{text:prompt}];
   if(images){const b64=await new Promise((ok,no)=>{const fr=new FileReader();fr.onload=()=>ok(String(fr.result).split(",")[1]);fr.onerror=no;fr.readAsDataURL(images)});parts.unshift({inlineData:{mimeType:images.type||"image/jpeg",data:b64}})}
-  const url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model||GDEF)}:generateContent`;
-  const body=JSON.stringify({contents:[{role:"user",parts}],generationConfig:{responseMimeType:"application/json",temperature:0.7}});
-  const key=cfg.key.trim();
-  // AQ. (auth) keys and AIza keys: send the key in the x-goog-api-key header first, then retry once with ?key= if Google rejects the header.
-  const call=async viaHeader=>{
-    try{return await fetch(viaHeader?url:url+"?key="+encodeURIComponent(key),{method:"POST",signal,body,headers:viaHeader?{"Content-Type":"application/json","x-goog-api-key":key}:{"Content-Type":"application/json"}})}
-    catch(e){if(e&&e.name==="AbortError")throw {code:"cancelled"};return null}
-  };
-  let res=await call(true);
-  if(!res||res.status===401||res.status===403){const r2=await call(false);if(r2)res=r2}
-  if(!res) throw {code:"network"};
-  if(!res.ok){
-    let msg="";try{msg=(await res.json()).error.message}catch(e){}
-    throw {code:res.status===429?"rate_limited":res.status===404?"bad_model":(res.status===401||res.status===403||(res.status===400&&/key/i.test(msg)))?"bad_key":"upstream_error",message:msg};
+  const saved=gModeSaved();
+  const order=saved==="query"?["query","header"]:["header","query"];
+  const notes=[];
+  for(const mode of order){
+    let r=await gAttempt({model,key,mode,parts,signal,onText,firstMs:images?90000:60000,idleMs:30000,stream:true});
+    if(r.kind==="http"&&r.status===400&&/think/i.test(r.msg)&&!THINK_OFF){THINK_OFF=true;r=await gAttempt({model,key,mode,parts,signal,onText,firstMs:60000,idleMs:30000,stream:true})}
+    const label=mode==="header"?"헤더 방식":"주소 방식";
+    if(r.kind==="ok"){
+      gModeSave(mode);
+      if(!r.text.trim()) throw {code:"empty_completion"};
+      return looseJSON(r.text);
+    }
+    notes.push(`${label}: ${r.info}`);
+    if(r.kind==="http"){
+      if(r.status===429) throw {code:"rate_limited",message:r.msg};
+      if(r.status===404) throw {code:"bad_model",message:r.msg};
+      if(r.status===401||r.status===403||(r.status===400&&/key|credential|auth/i.test(r.msg))) continue; // try the other way of sending the key
+      throw {code:"upstream_error",message:notes.join(" / ")};
+    }
+    if(r.kind==="timeout"&&notes.length===1&&!saved) continue;
+    if(r.kind==="net") continue;
+    throw {code:"timeout",message:notes.join(" / ")};
   }
-  const j=await res.json();
-  const text=(j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts||[]).map(p=>p.text||"").join("");
-  if(!text) throw {code:"empty_completion"};
-  if(onText) onText({text,delta:text});
-  return looseJSON(text);
+  const anyAuth=notes.some(n=>/HTTP (401|403|400)/.test(n));
+  throw {code:anyAuth?"bad_key":notes.some(n=>/응답 없음/.test(n))?"timeout":"network",message:notes.join(" / ")};
+}
+// Settings → 연결 시험: try both ways of sending the key with a tiny request and report each result.
+const GTEST={busy:false,lines:[]};
+async function gemTest(){
+  const c=readGemForm();if(!c.key){toast("API 키를 먼저 넣어 주세요.");return}
+  setGeminiCfg(c);GTEST.busy=true;GTEST.lines=["시험하는 중… (최대 40초)"];render();
+  const lines=[];
+  lines.push(`인터넷: ${navigator.onLine===false?"끊김":"연결됨"} · 주소: ${location.protocol==="file:"?"파일로 직접 엶":location.host}`);
+  lines.push(`키: ${c.key.slice(0,3)}… (${c.key.length}자) · 모델: ${c.model}`);
+  let okMode=null;
+  for(const mode of ["header","query"]){
+    const r=await gAttempt({model:c.model,key:c.key,mode,parts:[{text:'Reply with only this JSON: {"ok":true}'}],firstMs:20000,idleMs:20000,stream:false}).catch(e=>({kind:"err",info:String(e&&e.code||e)}));
+    lines.push(`${mode==="header"?"헤더 방식":"주소 방식"}: ${r.kind==="ok"?"성공 ("+r.info+")":r.info}`);
+    if(r.kind==="ok"&&!okMode)okMode=mode;
+  }
+  if(okMode){gModeSave(okMode);lines.unshift("✓ Gemini에 연결됐어요.")}
+  else lines.unshift("✗ Gemini에 연결하지 못했어요. 아래 내용을 그대로 알려 주시면 원인을 찾을 수 있어요.");
+  GTEST.busy=false;GTEST.lines=lines;render();
 }
 function aiErr(e){
   const c=e&&e.code;
@@ -385,14 +483,17 @@ function aiErr(e){
     no_key:"설정에서 Gemini API 키를 먼저 넣어 주세요.",
     bad_key:"Gemini가 이 키를 받아 주지 않았어요. 키를 다시 복사해 넣어 주세요.",
     bad_model:"Gemini 모델 이름을 찾을 수 없어요. 설정에서 모델 이름을 확인해 주세요.",
-    network:"Gemini에 연결하지 못했어요. 인터넷 연결을 확인해 주세요.",
+    network:"Gemini에 연결하지 못했어요.",
+    timeout:"Gemini가 너무 오래 답하지 않아 멈췄어요. 잠시 뒤 다시 시도해 주세요.",
+    offline:"인터넷이 끊겨 있어요. 연결한 뒤 다시 시도해 주세요.",
+    empty_completion:"Gemini가 빈 답을 보냈어요. 다시 시도해 주세요.",
     not_granted:"Claude 사용이 허락되지 않아 AI 기능을 쓸 수 없어요.",
     sampling_disabled:"이 계정에서는 Claude를 쓸 수 없어요.",
     rate_limited:"사용량 한도에 걸렸어요. 조금 뒤에 다시 시도해 주세요.",
     invalid_json:"AI 응답 형식이 깨졌어요. 다시 시도해 주세요.",
   })[c];
   const detail=e&&e.message?` (Google: ${String(e.message).slice(0,140)})`:"";
-  if(t) return c==="bad_key"||c==="bad_model"?t+detail:t;
+  if(t) return ["bad_key","bad_model","network","timeout"].includes(c)?t+detail:t;
   return detail?"AI 응답을 받지 못했어요."+detail:"AI 응답을 받지 못했어요. 다시 시도해 주세요.";
 }
 
@@ -439,7 +540,7 @@ function viewHome(){
   const today=allWords().filter(w=>w.date===TODAY);
   const cats=settings().cats.filter(c=>c.on);
   let gen="";
-  if(UI.gen){gen=`<div class="panel stack"><div class="row" style="justify-content:space-between"><b>오늘의 단어를 고르는 중…</b><button class="btn" data-act="gen-stop">중지</button></div><div class="gen-out" id="gen-out">${esc(UI.gen.text||("잠시만 기다려 주세요. "+(IN_CLAUDE?"처음에는 Claude 사용 허락을 묻는 창이 뜰 수 있어요.":"Gemini가 답을 다 쓰면 한 번에 보여 줘요.")))}</div></div>`}
+  if(UI.gen){gen=`<div class="panel stack"><div class="row" style="justify-content:space-between"><b>오늘의 단어를 고르는 중…</b><button class="btn" data-act="gen-stop">중지</button></div><div class="gen-out" id="gen-out">${esc(UI.gen.text||("잠시만 기다려 주세요. "+(IN_CLAUDE?"처음에는 Claude 사용 허락을 묻는 창이 뜰 수 있어요.":"Gemini가 생각을 마치면 쓰는 대로 보여 줘요.")))}</div></div>`}
   else if(total>0){gen=`<div class="panel stack"><div><h2>오늘의 단어가 준비되지 않았어요</h2><p class="muted small" style="margin:4px 0 0">${miss.map(x=>`${esc(x.c.name)} ${x.need}개`).join(" · ")}</p></div><button class="btn primary big" data-act="gen">오늘의 단어 ${total}개 받기</button></div>`}
   const groups=cats.map(c=>{const ws=today.filter(w=>w.cat===c.id);if(!ws.length)return"";return `<section class="catblock"><div class="cathead"><h3>${esc(c.name)} <span class="muted" style="font-weight:400">· ${KIND_LABEL[c.kind]||""}</span></h3><span class="n">${ws.length}</span></div><div class="wlist">${ws.map(w=>wordCard(w)).join("")}</div></section>`}).join("");
   const other=today.filter(w=>!cats.some(c=>c.id===w.cat));
@@ -856,7 +957,8 @@ function aiPanel(){
     <div class="field"><label for="gem-key">Gemini API 키</label><input type="password" id="gem-key" autocomplete="off" placeholder="AQ.… 로 시작하는 키" value="${esc(c.key)}"></div>
     <div class="field"><label for="gem-model">모델 이름</label><input type="text" id="gem-model" value="${esc(c.model)}"></div>
     <p class="muted small" style="margin:0">키는 Google AI Studio(aistudio.google.com)에서 무료로 받을 수 있어요. 키는 이 브라우저에만 저장되고 Google 말고는 어디에도 보내지 않아요. 모델 이름은 그대로 두면 항상 최신 Flash 모델을 써요. 특정 모델을 고정하고 싶을 때만 바꿔 주세요(예: gemini-3.8-flash).</p>
-    <div class="row"><button class="btn primary" type="submit">저장</button><button class="btn" type="button" data-act="gem-test">연결 시험</button>${c.key?`<span class="small" style="color:var(--moegi)">키 저장됨</span>`:""}</div></form>`;
+    <div class="row"><button class="btn primary" type="submit">저장</button><button class="btn" type="button" data-act="gem-test" ${GTEST.busy?"disabled":""}>${GTEST.busy?"시험하는 중…":"연결 시험"}</button>${c.key?`<span class="small" style="color:var(--moegi)">키 저장됨</span>`:""}</div>
+    ${GTEST.lines.length?`<div class="gen-out" style="max-height:none;color:var(--ink);user-select:text">${GTEST.lines.map(esc).join("\n")}</div>`:""}</form>`;
 }
 
 // ---------- generation ----------
@@ -955,12 +1057,6 @@ document.addEventListener("change",e=>{
   if(e.target.dataset.xi!==undefined&&EXT.items){EXT.items[+e.target.dataset.xi].on=e.target.checked;render()}
 });
 function readGemForm(){const k=$("#gem-key"),m=$("#gem-model");return {key:(k?k.value:"").trim(),model:(m&&m.value.trim())||GDEF}}
-async function gemTest(){
-  const c=readGemForm();if(!c.key){toast("API 키를 먼저 넣어 주세요.");return}
-  setGeminiCfg(c);toast("연결을 시험하는 중…");
-  try{const r=await aiJSON('Reply with only this JSON: {"ok":true}');toast(r&&r.ok?"Gemini에 연결됐어요.":"연결은 됐지만 응답이 이상해요.")}catch(e){toast(aiErr(e))}
-  render();
-}
 document.addEventListener("submit",e=>{
   e.preventDefault();
   if(e.target.id==="addw"){
