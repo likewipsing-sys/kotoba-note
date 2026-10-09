@@ -434,29 +434,39 @@ async function geminiJSON(prompt,{signal,onText,images}={}){
   if(images){const b64=await new Promise((ok,no)=>{const fr=new FileReader();fr.onload=()=>ok(String(fr.result).split(",")[1]);fr.onerror=no;fr.readAsDataURL(images)});parts.unshift({inlineData:{mimeType:images.type||"image/jpeg",data:b64}})}
   const saved=gModeSaved();
   const order=saved==="query"?["query","header"]:["header","query"];
-  const notes=[];
-  for(const mode of order){
-    let r=await gAttempt({model,key,mode,parts,signal,onText,firstMs:images?90000:60000,idleMs:30000,stream:true});
-    if(r.kind==="http"&&r.status===400&&/think/i.test(r.msg)&&!THINK_OFF){THINK_OFF=true;r=await gAttempt({model,key,mode,parts,signal,onText,firstMs:60000,idleMs:30000,stream:true})}
-    const label=mode==="header"?"헤더 방식":"주소 방식";
-    if(r.kind==="ok"){
-      gModeSave(mode);
-      if(!r.text.trim()) throw {code:"empty_completion"};
-      return looseJSON(r.text);
+  // If the chosen model is busy (high demand / quota), fall back to other Flash models; each has its own free quota.
+  const models=[...new Set([model,"gemini-flash-latest","gemini-flash-lite-latest","gemini-3.5-flash-lite","gemini-3.5-flash","gemini-3.1-flash-lite"])];
+  const isBusy=r=>r.kind==="http"&&([429,500,502,503,504].includes(r.status)||/demand|overload|unavailable|exhausted|try again|capacity/i.test(r.msg||""));
+  const notes=[];let busySeen=false,quotaSeen=false;
+  for(const m of models){
+    let modelDone=false;
+    for(const mode of order){
+      if(modelDone)break;
+      const run=()=>gAttempt({model:m,key,mode,parts,signal,onText,firstMs:images?90000:60000,idleMs:30000,stream:true});
+      let r=await run();
+      if(r.kind==="http"&&r.status===400&&/think/i.test(r.msg)&&!THINK_OFF){THINK_OFF=true;r=await run()}
+      if(isBusy(r)&&r.status!==429){await new Promise(ok=>setTimeout(ok,1500));if(signal&&signal.aborted)throw {code:"cancelled"};r=await run()}
+      const label=`${m} · ${mode==="header"?"헤더 방식":"주소 방식"}`;
+      if(r.kind==="ok"){
+        gModeSave(mode);
+        if(!r.text.trim()){notes.push(`${label}: 빈 답`);modelDone=true;continue}
+        if(m!==model) toast(`${model}이(가) 붐벼서 ${m}(으)로 답했어요.`);
+        return looseJSON(r.text);
+      }
+      notes.push(`${label}: ${r.info}`);
+      if(r.kind==="http"){
+        if(r.status===401||r.status===403||(r.status===400&&/key|credential|auth/i.test(r.msg))) continue; // other way of sending the key
+        if(isBusy(r)){busySeen=true;if(r.status===429)quotaSeen=true;modelDone=true;continue} // next model
+        if(r.status===404||(r.status===400&&/model/i.test(r.msg))){modelDone=true;continue}      // model not available to this key
+        throw {code:"upstream_error",message:r.info};
+      }
+      // timeout or network: try the other way of sending the key, then give up on this model
     }
-    notes.push(`${label}: ${r.info}`);
-    if(r.kind==="http"){
-      if(r.status===429) throw {code:"rate_limited",message:r.msg};
-      if(r.status===404) throw {code:"bad_model",message:r.msg};
-      if(r.status===401||r.status===403||(r.status===400&&/key|credential|auth/i.test(r.msg))) continue; // try the other way of sending the key
-      throw {code:"upstream_error",message:notes.join(" / ")};
-    }
-    if(r.kind==="timeout"&&notes.length===1&&!saved) continue;
-    if(r.kind==="net") continue;
-    throw {code:"timeout",message:notes.join(" / ")};
+    if(!busySeen&&notes.every(n=>/응답 없음|연결 실패|끊김/.test(n))) break; // the network itself is the problem; other models won't help
   }
-  const anyAuth=notes.some(n=>/HTTP (401|403|400)/.test(n));
-  throw {code:anyAuth?"bad_key":notes.some(n=>/응답 없음/.test(n))?"timeout":"network",message:notes.join(" / ")};
+  if(busySeen) throw {code:quotaSeen?"quota":"busy",message:notes.slice(-3).join(" / ")};
+  const anyAuth=notes.some(n=>/HTTP (401|403)/.test(n));
+  throw {code:anyAuth?"bad_key":notes.some(n=>/응답 없음/.test(n))?"timeout":"network",message:notes.slice(-4).join(" / ")};
 }
 // Settings → 연결 시험: try both ways of sending the key with a tiny request and report each result.
 const GTEST={busy:false,lines:[]};
@@ -486,6 +496,8 @@ function aiErr(e){
     network:"Gemini에 연결하지 못했어요.",
     timeout:"Gemini가 너무 오래 답하지 않아 멈췄어요. 잠시 뒤 다시 시도해 주세요.",
     offline:"인터넷이 끊겨 있어요. 연결한 뒤 다시 시도해 주세요.",
+    busy:"지금 Gemini를 쓰는 사람이 많아 모든 모델이 바빠요. 1~2분 뒤 다시 시도해 주세요.",
+    quota:"오늘 쓸 수 있는 무료 사용량을 다 썼거나 너무 자주 요청했어요. 잠시 뒤나 내일 다시 시도해 주세요.",
     empty_completion:"Gemini가 빈 답을 보냈어요. 다시 시도해 주세요.",
     not_granted:"Claude 사용이 허락되지 않아 AI 기능을 쓸 수 없어요.",
     sampling_disabled:"이 계정에서는 Claude를 쓸 수 없어요.",
