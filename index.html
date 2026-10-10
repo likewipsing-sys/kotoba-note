@@ -862,6 +862,7 @@ function viewWords(){
     <div class="row" style="justify-content:space-between"><h2>내 단어 ${all.length}개</h2></div>
     <input type="search" id="wq" placeholder="단어, 읽기, 뜻으로 찾기" value="${esc(UI.wq)}">
     <div class="row"><button class="chip" data-wc="all" aria-pressed="${UI.wCat==="all"}">전체</button>${used.map(id=>`<button class="chip" data-wc="${esc(id)}" aria-pressed="${UI.wCat===id}">${esc(catName(id))}</button>`).join("")}</div>
+    ${UI.wCat!=="all"?(()=>{const n=all.filter(w=>w.cat===UI.wCat).length;const c=settings().cats.find(x=>x.id===UI.wCat);return `<div class="panel row" style="justify-content:space-between"><div style="min-width:0"><b>${esc(catName(UI.wCat))}</b> <span class="muted small">${c&&c.kind?KIND_LABEL[c.kind]:""} · 단어 ${n}개</span></div><button class="btn primary" data-act="test-cat">이 분야만 테스트</button></div>`})():""}
     ${extractPanel()}
     <details class="panel"><summary style="cursor:pointer;font-weight:600">단어 직접 추가</summary>
       <form id="addw" class="stack" style="margin-top:12px">
@@ -895,16 +896,38 @@ async function setPhoto(file){
   if(EXT.imgUrl)URL.revokeObjectURL(EXT.imgUrl);
   EXT.img=b;EXT.imgUrl=URL.createObjectURL(b);EXT.mode="photo";EXT.items=null;render();
 }
-function itemList(){
+const NEWCAT={open:false,name:"",kind:"song"};
+const haveIn=cat=>new Set(allWords().filter(w=>w.cat===cat).map(w=>w.w));
+function catPicker(){
   const cats=[{id:"mytext",name:"내 글에서"},...settings().cats];
-  const have=new Set(allWords().map(w=>w.w));
+  return `<div class="stack" style="gap:8px;background:var(--paper);border-radius:8px;padding:10px 12px">
+    <div class="row"><label for="ext-cat" class="small" style="font-weight:600">넣을 분야</label>
+      <select id="ext-cat" style="flex:1 1 160px">${cats.map(c=>`<option value="${esc(c.id)}" ${EXT.cat===c.id&&!NEWCAT.open?"selected":""}>${esc(c.name)}${c.kind&&c.kind!=="topic"?` (${KIND_LABEL[c.kind]})`:""}</option>`).join("")}<option value="__new" ${NEWCAT.open?"selected":""}>+ 새 분야 만들기</option></select></div>
+    ${NEWCAT.open?`<div class="row"><select id="nc-kind">${["song","anime","drama","game","topic"].map(k=>`<option value="${k}" ${NEWCAT.kind===k?"selected":""}>${KIND_LABEL[k]}</option>`).join("")}</select>
+      <input type="text" id="nc-name" placeholder="예: 노래 제목, 작품 이름" value="${esc(NEWCAT.name)}" style="flex:1 1 160px" class="jp">
+      <button class="btn primary" type="button" data-act="nc-make">만들기</button><button class="btn" type="button" data-act="nc-cancel">취소</button></div>`:
+    `<span class="small muted">${EXT.cat==="mytext"?"노래나 작품별로 모아 보고 싶으면 \"새 분야 만들기\"로 제목을 넣어 주세요.":`단어장에서 「${esc(catName(EXT.cat))}」만 골라 보고 테스트할 수 있어요.`}</span>`}
+  </div>`;
+}
+function makeCat(){
+  const nm=(($("#nc-name")||{}).value||NEWCAT.name).trim();const kind=(($("#nc-kind")||{}).value)||NEWCAT.kind;
+  if(!nm){toast("분야 이름을 넣어 주세요.");return}
+  const st=settings();
+  let c=st.cats.find(x=>x.name===nm);
+  if(!c){c={id:"c"+Date.now().toString(36),name:nm,kind,count:5,on:false};st.cats.push(c);save("settings")}
+  EXT.cat=c.id;NEWCAT.open=false;NEWCAT.name="";
+  if(EXT.items){const h=haveIn(EXT.cat);EXT.items.forEach(x=>x.on=!h.has(x.w))}
+  toast(`「${nm}」 분야를 만들었어요.`);render();
+}
+function itemList(){
+  const have=haveIn(EXT.cat);
   const sel=EXT.items.filter(x=>x.on).length;
   return `${EXT.mode==="photo"&&EXT.imgUrl?`<img class="ph-thumb" src="${EXT.imgUrl}" alt="고른 사진">`:""}
     ${EXT.transcript?`<details class="transcript"><summary>사진에서 읽은 글</summary><div class="jp">${esc(EXT.transcript)}</div></details>`:""}
     <div class="row" style="justify-content:space-between"><b>찾은 단어 ${EXT.items.length}개</b><span class="row"><button class="chip" type="button" data-act="ext-all">모두 선택</button><button class="chip" type="button" data-act="ext-none">모두 해제</button></span></div>
-    <div>${EXT.items.map((x,i)=>`<label class="xitem" for="xi-${i}"><input type="checkbox" id="xi-${i}" data-xi="${i}" ${x.on?"checked":""}><div style="min-width:0"><span class="w">${esc(x.w)}</span>${x.r&&x.r!==x.w?`<span class="r">${esc(x.r)}</span>`:""}${say(x.r||x.w,x.w,"sm")}${have.has(x.w)?`<span class="dup">이미 있음</span>`:""}<div class="small">${esc(x.m)}${x.pos?` <span class="muted">· ${esc(x.pos)}</span>`:""}</div></div></label>`).join("")}</div>
-    <div class="row"><label for="ext-cat" class="small muted">넣을 분야</label><select id="ext-cat">${cats.map(c=>`<option value="${esc(c.id)}" ${EXT.cat===c.id?"selected":""}>${esc(c.name)}</option>`).join("")}</select></div>
-    <div class="row"><button class="btn primary" type="button" data-act="ext-add" ${sel?"":"disabled"} style="flex:1">선택한 ${sel}개 단어장에 추가</button><button class="btn" type="button" data-act="ext-reset">처음으로</button></div>`;
+    <div>${EXT.items.map((x,i)=>`<label class="xitem" for="xi-${i}"><input type="checkbox" id="xi-${i}" data-xi="${i}" ${x.on?"checked":""}><div style="min-width:0"><span class="w">${esc(x.w)}</span>${x.r&&x.r!==x.w?`<span class="r">${esc(x.r)}</span>`:""}${say(x.r||x.w,x.w,"sm")}${have.has(x.w)?`<span class="dup">이 분야에 이미 있음</span>`:""}<div class="small">${esc(x.m)}${x.pos?` <span class="muted">· ${esc(x.pos)}</span>`:""}</div></div></label>`).join("")}</div>
+    ${catPicker()}
+    <div class="row"><button class="btn primary" type="button" data-act="ext-add" ${sel&&!NEWCAT.open?"":"disabled"} style="flex:1">선택한 ${sel}개를 「${esc(catName(EXT.cat))}」에 추가</button><button class="btn" type="button" data-act="ext-reset">처음으로</button></div>`;
 }
 function photoInput(){
   if(IMG_OK===false) return `<div class="empty-state">이 화면에서는 사진을 ${AI_NAME}에게 보낼 수 없어요. 글을 직접 넣어 주세요.</div>`;
@@ -923,7 +946,7 @@ function extractPanel(){
   let body="";
   if(EXT.busy) body=`${EXT.mode==="photo"&&EXT.imgUrl?`<img class="ph-thumb" src="${EXT.imgUrl}" alt="고른 사진">`:""}<div class="row" style="justify-content:space-between"><span class="loading">${AI_NAME}가 ${EXT.mode==="photo"?"사진을 읽고 ":""}단어를 찾는 중…</span><button class="btn" type="button" data-act="ext-stop">중지</button></div><div class="gen-out">${esc(EXT.partial)}</div>`;
   else if(EXT.items) body=itemList();
-  else body=`<div class="seg" role="group" aria-label="찾는 방법"><button type="button" data-extmode="text" aria-pressed="${EXT.mode==="text"}">글 붙여 넣기</button><button type="button" data-extmode="photo" aria-pressed="${EXT.mode==="photo"}">사진으로 찾기</button></div>
+  else body=`${catPicker()}<div class="seg" role="group" aria-label="찾는 방법"><button type="button" data-extmode="text" aria-pressed="${EXT.mode==="text"}">글 붙여 넣기</button><button type="button" data-extmode="photo" aria-pressed="${EXT.mode==="photo"}">사진으로 찾기</button></div>
     ${EXT.mode==="photo"?photoInput():`<textarea id="ext-text" placeholder="일본어 문장을 붙여 넣으세요. 예: 駅前の喫茶店で友達と待ち合わせをした。">${esc(EXT.text)}</textarea>
     <button class="btn primary" type="button" data-act="ext-run">단어 찾기</button>`}`;
   return `<details class="panel" id="ext-panel" ${EXT.busy||EXT.items||EXT.text||EXT.imgUrl||UI.extOpen?"open":""}><summary style="cursor:pointer;font-weight:600">글·사진에서 단어 찾기</summary>
@@ -956,11 +979,13 @@ Text:
 ${text}
 """`;
   }
+  if(NEWCAT.open){toast("새 분야의 \"만들기\"를 먼저 눌러 주세요.");return}
+  if(EXT.cat!=="mytext"){const c=settings().cats.find(x=>x.id===EXT.cat);if(c)prompt+=`\n\nContext: this comes from the ${({song:"song",anime:"anime",drama:"drama or film",game:"game",topic:"topic"})[c.kind]||"topic"} "${c.name}". Use meanings that fit that context.`}
   const ctl=new AbortController();EXT.ctl=ctl;EXT.busy=true;EXT.partial="";EXT.transcript="";render();
   try{
     const res=await aiJSON(prompt,{...opts,signal:ctl.signal,onText:({text})=>{EXT.partial=text.slice(-300);const o=document.querySelector("#view .gen-out");if(o)o.textContent=EXT.partial}});
     const arr=(res&&Array.isArray(res.words)?res.words:Array.isArray(res)?res:[]).filter(x=>x&&x.w&&x.m);
-    const have=new Set(allWords().map(w=>w.w));
+    const have=haveIn(EXT.cat);
     EXT.transcript=photo&&res&&typeof res.text==="string"?res.text.slice(0,1200):"";
     EXT.items=arr.map(x=>({w:String(x.w),r:String(x.r||""),m:String(x.m),pos:String(x.pos||""),ex:String(x.ex||""),exk:String(x.exk||""),on:!have.has(String(x.w))}));
     if(!EXT.items.length){EXT.items=null;toast(photo?"사진에서 일본어 단어를 찾지 못했어요. 글자가 크고 또렷하게 나오게 다시 찍어 주세요.":"공부할 단어를 찾지 못했어요. 일본어 글인지 확인해 주세요.")}
@@ -1175,6 +1200,7 @@ document.addEventListener("click",e=>{
     case "kmore":UI.kShown+=480;render();break;
     case "close":closeSheet();break;
     case "close-bg":if(e.target===t)closeSheet();break;
+    case "test-cat":UI.sel=new Set(["c:"+UI.wCat]);UI.count=0;startSession();break;
     case "test-today":UI.sel=new Set(["today"]);UI.count=0;startSession();break;
     case "start":startSession();break;
     case "flip":UI.session.flipped=!UI.session.flipped;render();break;
@@ -1183,11 +1209,13 @@ document.addEventListener("click",e=>{
     case "pop-close":closePop();break;
     case "pop-retry":if(POP.word){const w=POP.word;POP.err="";fetchWordInfo(w,[...new Set([...w.w].filter(c=>isKanji(c)&&c!=="々"))])}break;
     case "ext-run":{const ta=$("#ext-text");if(ta)EXT.text=ta.value;runExtract();break}
+    case "nc-make":makeCat();break;
+    case "nc-cancel":NEWCAT.open=false;render();break;
     case "ext-stop":EXT.ctl&&EXT.ctl.abort();break;
     case "ext-reset":EXT.items=null;EXT.transcript="";if(EXT.imgUrl)URL.revokeObjectURL(EXT.imgUrl);EXT.img=null;EXT.imgUrl="";render();break;
     case "ext-all":EXT.items.forEach(x=>x.on=true);render();break;
     case "ext-none":EXT.items.forEach(x=>x.on=false);render();break;
-    case "ext-add":{const sel=EXT.items.filter(x=>x.on);const n=addWords(EXT.cat,sel,TODAY);toast(n?`단어 ${n}개를 단어장에 넣었어요.`:"모두 이미 있는 단어예요.");EXT.items=null;EXT.text="";EXT.transcript="";if(EXT.imgUrl)URL.revokeObjectURL(EXT.imgUrl);EXT.img=null;EXT.imgUrl="";render();break}
+    case "ext-add":{const sel=EXT.items.filter(x=>x.on);const n=addWords(EXT.cat,sel,TODAY);toast(n?`「${catName(EXT.cat)}」에 단어 ${n}개를 넣었어요.`:"모두 이 분야에 이미 있는 단어예요.");if(n)UI.wCat=EXT.cat;EXT.items=null;EXT.text="";EXT.transcript="";if(EXT.imgUrl)URL.revokeObjectURL(EXT.imgUrl);EXT.img=null;EXT.imgUrl="";render();break}
     case "gem-test":gemTest();break;
     case "bk-export":exportBackup();break;
     case "bk-merge":applyBackup("merge");break;
@@ -1196,6 +1224,7 @@ document.addEventListener("click",e=>{
   }
 });
 document.addEventListener("keydown",e=>{
+  if(e.target.id==="nc-name"&&e.key==="Enter"){e.preventDefault();makeCat();return}
   if(e.key==="Escape"&&POP.word){closePop();return}
   if(e.key==="Escape"&&$("#layer").innerHTML){closeSheet();return}
   const s=UI.session;if(UI.tab!=="test"||!s||s.i>=s.items.length)return;
@@ -1206,6 +1235,7 @@ document.addEventListener("keydown",e=>{
 let inputTimer=null;
 document.addEventListener("input",e=>{
   if(e.target.id==="ext-text"){EXT.text=e.target.value;return}
+  if(e.target.id==="nc-name"){NEWCAT.name=e.target.value;return}
   if(e.target.id==="kq"||e.target.id==="wq"){
     const id=e.target.id,val=e.target.value;clearTimeout(inputTimer);
     inputTimer=setTimeout(()=>{if(id==="kq"){UI.kq=val;UI.kShown=240}else UI.wq=val;render();const el=$("#"+id);if(el){el.focus();el.setSelectionRange(val.length,val.length)}},200);
@@ -1213,7 +1243,8 @@ document.addEventListener("input",e=>{
 });
 document.addEventListener("change",e=>{
   if(e.target.id==="lvl"){settings().level=+e.target.value;save("settings")}
-  if(e.target.id==="ext-cat")EXT.cat=e.target.value;
+  if(e.target.id==="ext-cat"){if(e.target.value==="__new"){NEWCAT.open=true;render();const i=$("#nc-name");if(i)i.focus()}else{EXT.cat=e.target.value;NEWCAT.open=false;if(EXT.items){const h=haveIn(EXT.cat);EXT.items.forEach(x=>x.on=!h.has(x.w))}render()}}
+  if(e.target.id==="nc-kind")NEWCAT.kind=e.target.value;
   if(e.target.id==="bk-file"&&e.target.files&&e.target.files[0]){readBackup(e.target.files[0]);e.target.value=""}
   if((e.target.id==="ph-cam"||e.target.id==="ph-pick")&&e.target.files&&e.target.files[0])setPhoto(e.target.files[0]);
   if(e.target.dataset.xi!==undefined&&EXT.items){EXT.items[+e.target.dataset.xi].on=e.target.checked;render()}
