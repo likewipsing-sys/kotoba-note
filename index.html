@@ -12,7 +12,7 @@
 <meta name="apple-mobile-web-app-title" content="ことば帳">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <style>body{margin:0}[hidden]{display:none!important}img{max-width:100%}</style>
-<script>if("serviceWorker" in navigator&&location.protocol==="https:")addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));</script>
+<script>if("serviceWorker" in navigator&&(location.protocol==="https:"||location.hostname==="localhost"))addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));</script>
 </head><body>
 <title>코토바 노트</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -206,6 +206,13 @@ textarea{width:100%;min-height:120px;resize:vertical;background:var(--surface);b
 .transcript summary{cursor:pointer;color:var(--ink-soft);font-size:13px}
 .transcript div{white-space:pre-wrap;margin-top:6px;line-height:1.7}
 label.btn{cursor:pointer;display:inline-block}
+.netbar{background:var(--shu-wash);color:var(--shu);border:1px solid var(--shu);border-radius:8px;padding:8px 12px;font-size:13px;margin-bottom:14px}
+.say{display:inline-grid;place-items:center;width:30px;height:30px;margin-left:6px;border-radius:50%;border:1px solid var(--line);background:var(--surface);color:var(--ai);font-size:16px;padding:0;vertical-align:middle;cursor:pointer;flex:none}
+.say:hover{border-color:var(--ai)}
+.say.on{background:var(--ai);color:var(--surface);border-color:var(--ai)}
+.say.sm{width:24px;height:24px;font-size:13px;margin-left:4px}
+.say.lg{width:44px;height:44px;font-size:22px;margin:4px auto 0}
+.card .back .say.lg{display:grid}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 
@@ -214,6 +221,7 @@ label.btn{cursor:pointer;display:inline-block}
     <div class="brand">ことば帳<small>코토바 노트 · 일본어 단어장</small></div>
     <div class="date" id="today-label"></div>
   </header>
+  <div class="netbar" id="netbar" hidden>오프라인이에요. 사전·단어장·테스트는 그대로 쓸 수 있고, 단어 받기·사진·한자 예시는 인터넷이 연결되면 다시 돼요.</div>
   <main id="view"></main>
 </div>
 <nav class="tabs" aria-label="메뉴"><div class="in" id="tabs"></div></nav>
@@ -258,7 +266,7 @@ const shuffle=a=>{for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()
 const kun=r=>r.replace(/\.(.+)$/,"($1)");
 const hash=s=>{let h=5381;for(const c of s)h=((h*33)^c.codePointAt(0))>>>0;return h.toString(36)};
 const GRADE_LABEL={1:"초1",2:"초2",3:"초3",4:"초4",5:"초5",6:"초6",8:"중학+"};
-function toast(msg){const t=document.createElement("div");t.className="toast";t.textContent=msg;document.body.append(t);setTimeout(()=>t.remove(),2600)}
+function toast(msg){document.querySelectorAll(".toast").forEach(x=>x.remove());const t=document.createElement("div");t.className="toast";t.textContent=msg;document.body.append(t);setTimeout(()=>t.remove(),2600)}
 
 // ---------- defaults ----------
 const DEFAULT_CATS=[
@@ -276,36 +284,137 @@ const LEVELS=["입문 (가나를 배우는 중)","N5","N4","N3","N2","N1"];
 // ---------- store ----------
 const S={mode:"loading",db:null,uid:null,docs:{},ready:false};
 const LKEY="kotoba-note-v1";
+// On-device storage: IndexedDB (large, kept by installed apps) with a localStorage mirror as a second copy.
+const IDB={db:null,timer:null};
+function idbOpen(){
+  return new Promise(ok=>{
+    try{
+      const rq=indexedDB.open("kotoba-note",1);
+      rq.onupgradeneeded=()=>rq.result.createObjectStore("kv");
+      rq.onsuccess=()=>ok(rq.result);rq.onerror=()=>ok(null);rq.onblocked=()=>ok(null);
+    }catch(e){ok(null)}
+  });
+}
+function idbGet(k){return new Promise(ok=>{try{const r=IDB.db.transaction("kv").objectStore("kv").get(k);r.onsuccess=()=>ok(r.result);r.onerror=()=>ok(undefined)}catch(e){ok(undefined)}})}
+function idbPut(k,v){return new Promise(ok=>{try{const t=IDB.db.transaction("kv","readwrite");t.objectStore("kv").put(v,k);t.oncomplete=()=>ok(true);t.onerror=t.onabort=()=>ok(false)}catch(e){ok(false)}})}
 function localLoad(){try{const r=localStorage.getItem(LKEY);return r?JSON.parse(r):{}}catch(e){return {}}}
-function localSave(){try{localStorage.setItem(LKEY,JSON.stringify(S.docs))}catch(e){}}
+function flushLocal(){
+  clearTimeout(IDB.timer);IDB.timer=null;
+  const json=JSON.stringify(S.docs);
+  if(IDB.db) idbPut("docs",{savedAt:Date.now(),json});
+  try{localStorage.setItem(LKEY,json)}catch(e){/* full: IndexedDB still holds everything */}
+}
+function localSave(){clearTimeout(IDB.timer);IDB.timer=setTimeout(flushLocal,250)}
+addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden"&&IDB.timer)flushLocal()});
+addEventListener("pagehide",()=>{if(IDB.timer)flushLocal()});
 const wq={};
 function save(id){
   localSave();
   if(S.mode!=="db") return;
   const body=JSON.parse(JSON.stringify(S.docs[id]));
   wq[id]=(wq[id]||Promise.resolve()).then(()=>S.db.collection("data/users/"+S.uid).doc(id).set(body)).catch(e=>{
-    if(e&&e.code==="invalid_argument"){S.mode="local";toast("계정에 저장할 수 없어 이 브라우저에 저장합니다.");render()}
+    if(e&&e.code==="invalid_argument"){S.mode="local";toast("계정에 저장할 수 없어 이 기기에 저장합니다.");render()}
     else toast("저장하지 못했어요. 잠시 후 다시 시도해 주세요.");
   });
 }
 let progTimer=null;
 function saveProgressSoon(){clearTimeout(progTimer);progTimer=setTimeout(()=>{save("progress");save("stats")},1500)}
+const DEVICE={persisted:null,usage:null};
 async function initStore(){
   S.docs=localLoad();
+  if(!IN_CLAUDE){
+    IDB.db=await idbOpen();
+    if(IDB.db){
+      const rec=await idbGet("docs");
+      if(rec&&rec.json){try{S.docs=JSON.parse(rec.json)}catch(e){}}
+      else if(Object.keys(S.docs).length) flushLocal(); // first run of this version: copy old data into IndexedDB
+    }
+    try{
+      if(navigator.storage&&navigator.storage.persist){
+        DEVICE.persisted=await navigator.storage.persisted();
+        if(!DEVICE.persisted) DEVICE.persisted=await navigator.storage.persist();
+      }
+      if(navigator.storage&&navigator.storage.estimate){const e=await navigator.storage.estimate();DEVICE.usage=e.usage}
+    }catch(e){}
+    S.mode="local";S.ready=true;render();return;
+  }
   try{
-    if(window.claude&&claude.use){
-      const [db,user]=await Promise.all([claude.use("db"),claude.use("user")]);
-      const id=user?await user.id():null;
-      if(db&&id){
-        S.db=db;S.uid=id;
-        const snap=await db.collection("data/users/"+id).limit(1000).get();
-        const remote={};snap.docs.forEach(d=>{remote[d.id]=JSON.parse(JSON.stringify(d.data()))});
-        if(Object.keys(remote).length){S.docs=remote;localSave();S.mode="db"}
-        else{S.mode="db";for(const k of Object.keys(S.docs))save(k)} // first run on this account: upload local data
-      } else S.mode="local";
+    const [db,user]=await Promise.all([claude.use("db"),claude.use("user")]);
+    const id=user?await user.id():null;
+    if(db&&id){
+      S.db=db;S.uid=id;
+      const snap=await db.collection("data/users/"+id).limit(1000).get();
+      const remote={};snap.docs.forEach(d=>{remote[d.id]=JSON.parse(JSON.stringify(d.data()))});
+      if(Object.keys(remote).length){S.docs=remote;localSave();S.mode="db"}
+      else{S.mode="db";for(const k of Object.keys(S.docs))save(k)} // first run on this account: upload local data
     } else S.mode="local";
   }catch(e){S.mode="local"}
   S.ready=true;render();
+}
+
+// ---------- backup file ----------
+const BK={pending:null,busy:false};
+function lastBackup(){try{return +localStorage.getItem("kotoba-last-backup")||0}catch(e){return 0}}
+function backupJSON(){
+  return JSON.stringify({app:"kotoba-note",version:1,exportedAt:new Date().toISOString(),docs:S.docs});
+}
+async function exportBackup(){
+  const name=`kotoba-backup-${TODAY}.json`;const data=backupJSON();
+  const done=()=>{try{localStorage.setItem("kotoba-last-backup",String(Date.now()))}catch(e){};toast("백업 파일을 저장했어요.");render()};
+  if(IN_CLAUDE){
+    const dl=await window.claude.use("downloads");
+    if(!dl){toast("이 화면에서는 파일을 저장할 수 없어요.");return}
+    try{await dl.save({filename:name,data});done()}catch(e){if(e&&e.code!=="declined")toast("백업 파일을 저장하지 못했어요.")}
+    return;
+  }
+  const file=new File([data],name,{type:"application/json"});
+  const standalone=matchMedia("(display-mode: standalone)").matches||navigator.standalone;
+  if(standalone&&navigator.canShare&&navigator.canShare({files:[file]})){
+    try{await navigator.share({files:[file],title:"ことば帳 백업"});done();return}catch(e){if(e&&e.name==="AbortError")return}
+  }
+  const a=document.createElement("a");a.href=URL.createObjectURL(file);a.download=name;document.body.append(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},2000);done();
+}
+async function readBackup(file){
+  try{
+    const o=JSON.parse(await file.text());
+    if(!o||o.app!=="kotoba-note"||typeof o.docs!=="object")throw 0;
+    const words=Object.entries(o.docs).filter(([k,d])=>k.startsWith("w-")&&d&&Array.isArray(d.words)).reduce((n,[,d])=>n+d.words.length,0);
+    BK.pending={docs:o.docs,words,at:o.exportedAt||""};render();
+  }catch(e){toast("ことば帳 백업 파일이 아니에요. kotoba-backup-….json 파일을 골라 주세요.")}
+}
+function mergeDocs(cur,inc){
+  const out=JSON.parse(JSON.stringify(cur));
+  for(const [k,d] of Object.entries(inc)){
+    if(!d||typeof d!=="object")continue;
+    if(!out[k]){out[k]=d;continue}
+    if(k.startsWith("w-")&&Array.isArray(d.words)){const ids=new Set(out[k].words.map(w=>w.id));for(const w of d.words)if(!ids.has(w.id))out[k].words.push(w)}
+    else if(k==="progress"){const p=out[k].p||(out[k].p={});for(const [key,v] of Object.entries(d.p||{}))if(!p[key]||v[0]>p[key][0])p[key]=v}
+    else if(k==="stats"){const s=out[k].days||(out[k].days={});for(const [day,n] of Object.entries(d.days||{}))s[day]=Math.max(s[day]||0,n)}
+    else if(k==="settings"){const ids=new Set(out[k].cats.map(c=>c.id));for(const c of d.cats||[])if(!ids.has(c.id))out[k].cats.push(c)}
+  }
+  return out;
+}
+function applyBackup(how){
+  if(!BK.pending)return;
+  S.docs=how==="replace"?JSON.parse(JSON.stringify(BK.pending.docs)):mergeDocs(S.docs,BK.pending.docs);
+  BK.pending=null;
+  for(const k of Object.keys(S.docs))save(k);
+  flushLocal();toast(how==="replace"?"백업으로 바꿨어요.":"백업을 합쳤어요.");render();
+}
+function backupPanel(){
+  const lb=lastBackup();const days=lb?Math.floor((Date.now()-lb)/864e5):null;
+  const p=BK.pending;
+  return `<div class="panel stack"><h3>기기 저장과 백업</h3>
+    <p class="small" style="margin:0">${IN_CLAUDE?"이 앱의 기록은 내 Claude 계정에 저장돼요. 백업 파일을 저장해 두면 GitHub에 올린 앱으로 옮겨 쓸 수 있어요.":
+      `단어장, 학습 기록, 설정은 모두 이 기기 안에 저장돼서 인터넷 없이도 그대로 남아요.${DEVICE.persisted===true?" 브라우저가 자동으로 지우지 않도록 보호돼 있어요.":DEVICE.persisted===false?" 이 브라우저는 저장 공간이 부족하면 기록을 지울 수 있어요. 홈 화면에 추가해서 쓰고 가끔 백업해 주세요.":""}${DEVICE.usage?` 지금 ${(DEVICE.usage/1048576).toFixed(1)}MB 사용 중.`:""}`}</p>
+    <p class="small muted" style="margin:0">${lb?`마지막 백업: ${days===0?"오늘":days+"일 전"}`:"아직 백업한 적이 없어요."} 휴대폰을 바꾸거나 브라우저 기록을 지우기 전에 백업 파일을 저장해 두세요.</p>
+    ${p?`<div class="stack" style="background:var(--paper);border-radius:8px;padding:12px">
+      <b>백업 파일: 단어 ${p.words}개${p.at?` · ${esc(p.at.slice(0,10))} 저장`:""}</b>
+      <div class="row"><button class="btn primary" type="button" data-act="bk-merge">지금 기록과 합치기</button><button class="btn" type="button" data-act="bk-replace" style="color:var(--shu);border-color:var(--shu)">이걸로 바꾸기</button><button class="btn" type="button" data-act="bk-cancel">취소</button></div>
+      <span class="small muted">합치기는 양쪽 단어를 모두 남기고, 바꾸기는 지금 기록을 지우고 백업으로 바꿔요.</span></div>`:
+    `<div class="row"><button class="btn primary" type="button" data-act="bk-export">백업 파일 저장</button><label class="btn" for="bk-file">백업 불러오기</label><input type="file" id="bk-file" accept="application/json,.json" hidden></div>`}
+  </div>`;
 }
 const settings=()=>S.docs.settings||(S.docs.settings={cats:JSON.parse(JSON.stringify(DEFAULT_CATS)),level:1});
 const progress=()=>(S.docs.progress||(S.docs.progress={p:{}})).p;
@@ -521,7 +630,9 @@ const TABS=[["home","今","오늘"],["dict","字","사전"],["words","語","단�
 function renderTabs(){
   $("#tabs").innerHTML=TABS.map(([id,ch,lb])=>`<button data-tab="${id}" ${UI.tab===id?'aria-current="page"':""}><b>${ch}</b>${lb}</button>`).join("");
 }
+addEventListener("online",()=>render());addEventListener("offline",()=>render());
 function render(){
+  const nb=$("#netbar");if(nb)nb.hidden=navigator.onLine!==false;
   $("#today-label").textContent=new Date().toLocaleDateString("ko-KR",{year:"numeric",month:"long",day:"numeric",weekday:"short"});
   renderTabs();
   const v=$("#view");
@@ -537,11 +648,36 @@ function missingToday(){
   return settings().cats.filter(c=>c.on).map(c=>({c,need:Math.max(0,c.count-ws.filter(w=>w.cat===c.id).length)})).filter(x=>x.need>0);
 }
 
+// ---------- pronunciation (device text-to-speech, works offline when a Japanese voice is installed) ----------
+const TTS={ok:typeof speechSynthesis!=="undefined"&&typeof SpeechSynthesisUtterance!=="undefined",voice:null,warned:false,rate:1};
+try{TTS.rate=+localStorage.getItem("kotoba-tts-rate")||1}catch(e){}
+function pickVoice(){
+  if(!TTS.ok)return null;
+  const vs=speechSynthesis.getVoices().filter(v=>/^ja(-|_|$)/i.test(v.lang));
+  TTS.voice=vs.find(v=>/kyoko|otoya|google|o-ren|haruka|nanami|ayumi/i.test(v.name))||vs.find(v=>v.localService)||vs[0]||null;
+  return TTS.voice;
+}
+if(TTS.ok){pickVoice();speechSynthesis.addEventListener&&speechSynthesis.addEventListener("voiceschanged",pickVoice)}
+function speak(text,btn){
+  text=String(text||"").replace(/[.\-]/g,"").trim();if(!text)return;
+  if(!TTS.ok){toast("이 브라우저는 소리 읽기를 지원하지 않아요.");return}
+  speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang="ja-JP";u.rate=TTS.rate*0.9;
+  const v=TTS.voice||pickVoice();if(v)u.voice=v;
+  else if(!TTS.warned){TTS.warned=true;setTimeout(()=>{if(!speechSynthesis.speaking)toast("일본어 음성이 없어요. 기기 설정 → 언어/음성에서 일본어 음성을 받아 주세요.")},900)}
+  if(btn){document.querySelectorAll(".say.on").forEach(b=>b.classList.remove("on"));btn.classList.add("on");const off=()=>btn.classList.remove("on");u.onend=off;u.onerror=off}
+  speechSynthesis.speak(u);
+}
+const SAY_ICON='<svg viewBox="0 0 20 20" width="1em" height="1em" aria-hidden="true"><path d="M3 7.5h3l4-3.5v12l-4-3.5H3z" fill="currentColor"/><path d="M13 7a4 4 0 0 1 0 6M15.2 4.8a7 7 0 0 1 0 10.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+const say=(text,label,cls="")=>text?`<button type="button" class="say ${cls}" data-say="${esc(text)}" aria-label="${esc(label||text)} 발음 듣기" title="발음 듣기">${SAY_ICON}</button>`:"";
+const sayW=w=>say(w.r||w.w,w.w);
+
 function wordCard(w,showCat){
-  return `<div class="word"><div><button class="w wbtn" data-wp="${esc(w.id)}" aria-label="${esc(w.w)} 한자 풀이 보기">${esc(w.w)}</button>${w.r&&w.r!==w.w?`<span class="r">${esc(w.r)}</span>`:""}${w.pos?`<span class="pos">${esc(w.pos)}</span>`:""}</div>
+  return `<div class="word"><div><button class="w wbtn" data-wp="${esc(w.id)}" aria-label="${esc(w.w)} 한자 풀이 보기">${esc(w.w)}</button>${w.r&&w.r!==w.w?`<span class="r">${esc(w.r)}</span>`:""}${sayW(w)}${w.pos?`<span class="pos">${esc(w.pos)}</span>`:""}</div>
   ${showCat?`<span class="tag">${esc(catName(w.cat))}</span>`:"<span></span>"}
   <div class="m">${esc(w.m)}</div>
-  ${w.ex?`<div class="ex"><div class="j">${esc(w.ex)}</div><div>${esc(w.exk)}</div>${w.note?`<div>팁: ${esc(w.note)}</div>`:""}</div>`:(w.note?`<div class="ex">${esc(w.note)}</div>`:"")}</div>`;
+  ${w.ex?`<div class="ex"><div class="j">${esc(w.ex)}${say(w.ex,"예문","sm")}</div><div>${esc(w.exk)}</div>${w.note?`<div>팁: ${esc(w.note)}</div>`:""}</div>`:(w.note?`<div class="ex">${esc(w.note)}</div>`:"")}</div>`;
 }
 
 function viewHome(){
@@ -568,7 +704,8 @@ function viewHome(){
     ${groups}
     ${other.length?`<section class="catblock"><h3>기타</h3><div class="wlist">${other.map(w=>wordCard(w,true)).join("")}</div></section>`:""}
     ${!today.length&&!total&&!UI.gen?`<div class="empty-state">켜 둔 분야가 없어요. 설정에서 공부할 분야나 좋아하는 애니메이션·노래를 추가해 주세요.</div>`:""}
-    <p class="muted small">분야와 하루 개수는 <a href="#" data-tab="set" style="color:var(--ai)">설정</a>에서 바꿀 수 있어요. ${S.mode==="db"?"학습 기록은 내 Claude 계정에 저장돼요.":S.mode==="local"?"학습 기록은 이 브라우저에만 저장돼요.":""}</p>
+    ${!IN_CLAUDE&&allWords().length>=10&&Date.now()-lastBackup()>14*864e5?`<div class="panel row" style="justify-content:space-between"><span class="small">${lastBackup()?"마지막 백업이 2주 넘게 지났어요.":"아직 백업 파일이 없어요."} 기기를 바꿀 때를 대비해 저장해 두세요.</span><button class="btn" data-act="bk-export">백업 파일 저장</button></div>`:""}
+    <p class="muted small">분야와 하루 개수는 <a href="#" data-tab="set" style="color:var(--ai)">설정</a>에서 바꿀 수 있어요. ${S.mode==="db"?"학습 기록은 내 Claude 계정에 저장돼요.":S.mode==="local"?"학습 기록은 이 기기에 저장돼서 인터넷 없이도 남아요.":""}</p>
   </div>`;
 }
 
@@ -610,8 +747,8 @@ function kanjiDetail(c){
       <div class="stack" style="gap:4px;min-width:0"><div style="font-size:22px;font-weight:600">${esc(k[6]||"—")}</div><div class="muted small">${esc(k[8])}</div>
       <div class="row small"><span class="tag">${GRADE_LABEL[k[1]]||""}</span>${k[2]?`<span class="tag">JLPT N${k[2]}</span>`:""}<span class="tag">${k[3]}획</span>${b>=0?`<span class="tag" style="background:var(--moegi-wash);color:var(--moegi)">${b>=3?"외움":"공부 중"}</span>`:""}</div></div></div>
     <dl class="dl">
-      <dt>음독 音読み</dt><dd>${esc(k[4].split(",").filter(Boolean).map(r=>r.replace(/-/g,"")).join("、")||"—")}</dd>
-      <dt>훈독 訓読み</dt><dd>${esc(k[5].split(",").filter(Boolean).map(r=>kun(r.replace(/-/g,""))).join("、")||"—")}</dd>
+      <dt>음독 音読み</dt><dd>${esc(k[4].split(",").filter(Boolean).map(r=>r.replace(/-/g,"")).join("、")||"—")}${say(k[4].split(",").filter(Boolean).join("、"),"음독","sm")}</dd>
+      <dt>훈독 訓読み</dt><dd>${esc(k[5].split(",").filter(Boolean).map(r=>kun(r.replace(/-/g,""))).join("、")||"—")}${say(k[5].split(",").filter(Boolean).join("、"),"훈독","sm")}</dd>
       ${k[7]?`<dt>한국 정자</dt><dd style="font-family:var(--f-char);font-size:20px">${esc(k[7])}</dd>`:""}
       <dt>사용 빈도</dt><dd>${k[9]<9999?`신문 기준 ${k[9]}위`:"—"}</dd>
     </dl>
@@ -622,7 +759,7 @@ function kanaDetail(c,kind){
   const all=["basic","daku","yoon"].flatMap(g=>kanaSet(kind,g));const x=all.find(y=>y.c===c);if(!x)return;
   const other=kind==="h"?toKata(c):[...c].map(ch=>String.fromCharCode(ch.charCodeAt(0)-0x60)).join("");
   openSheet(`<div class="stack"><div class="dhead"><div class="sq"><span style="${c.length>1?"font-size:56px":""}">${c}</span></div>
-    <dl class="dl"><dt>로마자</dt><dd>${x.ro}</dd><dt>한글 발음</dt><dd>${x.ko}</dd><dt>${kind==="h"?"가타카나":"히라가나"}</dt><dd style="font-family:var(--f-char);font-size:22px">${other}</dd></dl></div>
+    <dl class="dl"><dt>소리</dt><dd>${say(c,c)}</dd><dt>로마자</dt><dd>${x.ro}</dd><dt>한글 발음</dt><dd>${x.ko}</dd><dt>${kind==="h"?"가타카나":"히라가나"}</dt><dd style="font-family:var(--f-char);font-size:22px">${other}</dd></dl></div>
     <button class="btn" data-act="close">닫기</button></div>`);
 }
 // ---------- word popover ----------
@@ -671,13 +808,13 @@ function popBody(w){
     return `<div class="kp"><div class="sq" role="button" tabindex="0" data-kanji="${esc(c)}" title="자세히"><span>${esc(c)}</span></div>
       <div class="info"><div class="ko">${esc(k?(k[6]||k[8]):"상용한자 밖의 글자")}</div>
         ${p&&p.used?`<span class="used">이 단어에서 ${esc(p.used)} · ${esc(p.type)}</span>`:""}
-        ${k?`<div class="rd jp"><b>음</b>${esc(on||"—")}</div><div class="rd jp"><b>훈</b>${esc(ku||"—")}</div>`:""}
+        ${k?`<div class="rd jp"><b>음</b>${esc(on||"—")}${say(on,"음독","sm")}</div><div class="rd jp"><b>훈</b>${esc(ku||"—")}${say(ku.replace(/[()]/g,""),"훈독","sm")}</div>`:""}
       </div>
-      <div class="exs">${all.slice(0,lim).map(e=>`<div class="ex"><span class="j">${esc(e.w)}</span><span class="rr">${esc(e.r)}</span><span>${esc(e.m)}${e.own?`<span class="src">내 단어장</span>`:e.t?`<span class="src" style="color:var(--ink-soft)">${esc(e.t)}</span>`:""}</span></div>`).join("")}
+      <div class="exs">${all.slice(0,lim).map(e=>`<div class="ex"><span class="j">${esc(e.w)}${say(e.r||e.w,e.w,"sm")}</span><span class="rr">${esc(e.r)}</span><span>${esc(e.m)}${e.own?`<span class="src">내 단어장</span>`:e.t?`<span class="src" style="color:var(--ink-soft)">${esc(e.t)}</span>`:""}</span></div>`).join("")}
         ${all.length>lim?`<button class="more" data-popmore="${esc(c)}">예시 ${all.length-lim}개 더 보기</button>`:""}
         ${!all.length&&!POP.busy&&!POP.err?`<span class="loading">예시 단어가 없어요.</span>`:""}</div></div>`;
   }).join("");
-  return `<div class="ph"><div><span class="w">${esc(w.w)}</span>${w.r&&w.r!==w.w?`<span class="r">${esc(w.r)}</span>`:""}<div class="small muted">${esc(w.m||"")}</div></div><button class="x" data-act="pop-close" aria-label="닫기">×</button></div>
+  return `<div class="ph"><div><span class="w">${esc(w.w)}</span>${w.r&&w.r!==w.w?`<span class="r">${esc(w.r)}</span>`:""}${sayW(w)}<div class="small muted">${esc(w.m||"")}</div></div><button class="x" data-act="pop-close" aria-label="닫기">×</button></div>
     ${uniq.length?blocks:`<div class="loading">한자가 없는 단어예요.</div>`}
     ${POP.busy?`<div class="loading">${AI_NAME}가 한자별 읽기와 예시 단어를 찾는 중…</div>`:""}
     ${POP.err?`<div class="loading" style="color:var(--shu)">${esc(POP.err)} ${uniq.length?`<button class="more" data-act="pop-retry">다시 시도</button>`:""}</div>`:""}`;
@@ -765,7 +902,7 @@ function itemList(){
   return `${EXT.mode==="photo"&&EXT.imgUrl?`<img class="ph-thumb" src="${EXT.imgUrl}" alt="고른 사진">`:""}
     ${EXT.transcript?`<details class="transcript"><summary>사진에서 읽은 글</summary><div class="jp">${esc(EXT.transcript)}</div></details>`:""}
     <div class="row" style="justify-content:space-between"><b>찾은 단어 ${EXT.items.length}개</b><span class="row"><button class="chip" type="button" data-act="ext-all">모두 선택</button><button class="chip" type="button" data-act="ext-none">모두 해제</button></span></div>
-    <div>${EXT.items.map((x,i)=>`<label class="xitem" for="xi-${i}"><input type="checkbox" id="xi-${i}" data-xi="${i}" ${x.on?"checked":""}><div style="min-width:0"><span class="w">${esc(x.w)}</span>${x.r&&x.r!==x.w?`<span class="r">${esc(x.r)}</span>`:""}${have.has(x.w)?`<span class="dup">이미 있음</span>`:""}<div class="small">${esc(x.m)}${x.pos?` <span class="muted">· ${esc(x.pos)}</span>`:""}</div></div></label>`).join("")}</div>
+    <div>${EXT.items.map((x,i)=>`<label class="xitem" for="xi-${i}"><input type="checkbox" id="xi-${i}" data-xi="${i}" ${x.on?"checked":""}><div style="min-width:0"><span class="w">${esc(x.w)}</span>${x.r&&x.r!==x.w?`<span class="r">${esc(x.r)}</span>`:""}${say(x.r||x.w,x.w,"sm")}${have.has(x.w)?`<span class="dup">이미 있음</span>`:""}<div class="small">${esc(x.m)}${x.pos?` <span class="muted">· ${esc(x.pos)}</span>`:""}</div></div></label>`).join("")}</div>
     <div class="row"><label for="ext-cat" class="small muted">넣을 분야</label><select id="ext-cat">${cats.map(c=>`<option value="${esc(c.id)}" ${EXT.cat===c.id?"selected":""}>${esc(c.name)}</option>`).join("")}</select></div>
     <div class="row"><button class="btn primary" type="button" data-act="ext-add" ${sel?"":"disabled"} style="flex:1">선택한 ${sel}개 단어장에 추가</button><button class="btn" type="button" data-act="ext-reset">처음으로</button></div>`;
 }
@@ -896,16 +1033,18 @@ function cardHTML(it,flipped){
   if(it.type==="kana"){
     front=rev?`<div class="front ko">${it.x.ko} <span class="muted" style="font-size:.7em">(${it.x.ro})</span><div class="hint">${it.kind==="h"?"히라가나":"가타카나"}로 쓰면?</div></div>`:`<div class="sq"><span class="front" style="${it.x.c.length>1?"font-size:clamp(48px,15vw,84px)":""}">${it.x.c}</span></div>`;
     back=rev?`<div class="sq" style="width:min(40vw,140px)"><span style="font-size:72px">${it.x.c}</span></div>`:`<div class="big">${it.x.ko}</div><div class="muted" style="font-family:var(--f-mono)">${it.x.ro}</div>`;
+    back+=`<div>${say(it.x.c,it.x.c,"lg")}</div>`;
   } else if(it.type==="kanji"){
     const k=it.k;
     front=rev?`<div class="front ko">${esc(k[6]||k[8])}<div class="hint">${esc(k[8])}</div></div>`:`<div class="sq"><span class="front">${k[0]}</span></div>`;
     back=`${rev?`<div class="sq" style="width:min(40vw,140px)"><span style="font-size:80px">${k[0]}</span></div>`:`<div class="big">${esc(k[6]||"—")}</div><div class="muted small">${esc(k[8])}</div>`}
-      <dl><dt>음독</dt><dd>${esc(k[4].replace(/-/g,"").split(",").join("、")||"—")}</dd><dt>훈독</dt><dd>${esc(k[5].split(",").filter(Boolean).map(r=>kun(r.replace(/-/g,""))).join("、")||"—")}</dd></dl>`;
+      <dl><dt>음독</dt><dd>${esc(k[4].replace(/-/g,"").split(",").join("、")||"—")}${say(k[4].split(",").filter(Boolean).join("、"),"음독","sm")}</dd><dt>훈독</dt><dd>${esc(k[5].split(",").filter(Boolean).map(r=>kun(r.replace(/-/g,""))).join("、")||"—")}${say(k[5].split(",").filter(Boolean).join("、"),"훈독","sm")}</dd></dl>`;
   } else {
     const w=it.w;
     front=rev?`<div class="front ko">${esc(w.m)}<div class="hint">${esc(catName(w.cat))}${w.pos?" · "+esc(w.pos):""}</div></div>`:`<div class="front long">${esc(w.w)}</div>`;
     back=`${rev?`<div class="jpbig">${esc(w.w)}</div>`:`<div class="big">${esc(w.m)}</div>`}${w.r&&w.r!==w.w?`<div class="jp muted" style="font-size:18px">${esc(w.r)}</div>`:""}
-      ${w.ex?`<div class="small" style="margin-top:6px;border-top:1px dashed var(--line);padding-top:8px"><div class="jp">${esc(w.ex)}</div><div class="muted">${esc(w.exk)}</div></div>`:""}
+      <div>${say(w.r||w.w,w.w,"lg")}</div>
+      ${w.ex?`<div class="small" style="margin-top:6px;border-top:1px dashed var(--line);padding-top:8px"><div class="jp">${esc(w.ex)}${say(w.ex,"예문","sm")}</div><div class="muted">${esc(w.exk)}</div></div>`:""}
       ${[...w.w].some(isKanji)?`<div><button class="btn" style="font-size:13px;padding:5px 12px" data-wp="${esc(w.id)}">한자 풀이 보기</button></div>`:""}`;
   }
   return `<div class="card" data-act="flip" role="button" tabindex="0" aria-label="카드 뒤집기">${front}${flipped?`<div class="back">${back}</div>`:`<div class="hint">눌러서 정답 보기 · 스페이스</div>`}</div>`;
@@ -946,6 +1085,8 @@ function viewSet(){
     <h2>공부 설정</h2>
     <div class="panel stack"><label class="row" for="lvl"><span style="flex:1">내 수준</span><select id="lvl">${LEVELS.map((l,i)=>`<option value="${i}" ${st.level===i?"selected":""}>${l}</option>`).join("")}</select></label>
       <p class="muted small" style="margin:0">오늘의 단어 난이도를 이 수준에 맞춰 골라요.</p></div>
+    <div class="panel stack"><div class="row" style="justify-content:space-between"><span>발음 속도</span><div class="seg">${[[0.7,"천천히"],[1,"보통"],[1.2,"빠르게"]].map(([r,l])=>`<button type="button" data-rate-tts="${r}" aria-pressed="${TTS.rate===r}">${l}</button>`).join("")}</div></div>
+      <div class="row"><span class="small muted" style="flex:1">${!TTS.ok?"이 브라우저는 소리 읽기를 지원하지 않아요.":TTS.voice?`일본어 음성: ${esc(TTS.voice.name)}`:"일본어 음성을 찾는 중이에요. 소리가 안 나면 기기 설정에서 일본어 음성을 받아 주세요."}</span>${say("こんにちは。日本語を勉強しましょう。","시험")}</div></div>
     <div class="panel"><h3 style="margin-bottom:4px">분야별 하루 단어 수</h3>
       ${st.cats.map(c=>`<div class="setcat"><button class="switch" role="switch" aria-checked="${c.on}" aria-label="${esc(c.name)} 켜기" data-tog="${esc(c.id)}"></button>
         <div style="min-width:0"><div style="font-weight:500">${esc(c.name)}</div><div class="muted small">${KIND_LABEL[c.kind]||""}${c.kind!=="topic"?` · <button class="btn" style="padding:0 6px;font-size:12px;${UI.confirmDel===c.id?"color:var(--shu);border-color:var(--shu)":""}" data-delcat="${esc(c.id)}">${UI.confirmDel===c.id?"정말 삭제":"삭제"}</button>`:""}</div></div>
@@ -957,7 +1098,8 @@ function viewSet(){
       <input type="text" id="ac-name" placeholder="예: 귀멸의 칼날 / YOASOBI「アイドル」/ 병원" required style="flex:1 1 200px"></div>
       <button class="btn primary" type="submit">추가</button></form>
     ${aiPanel()}
-    <p class="muted small">${S.mode==="db"?"모든 기록은 내 Claude 계정에 저장돼서 다른 기기에서도 이어서 볼 수 있어요.":"지금은 이 브라우저에만 저장돼요."} 한자 훈음은 한국어문회 급수 한자표, 읽기와 학년·JLPT 정보는 kanji-data를 바탕으로 해요.</p>
+    ${backupPanel()}
+    <p class="muted small">${S.mode==="db"?"모든 기록은 내 Claude 계정에 저장돼서 다른 기기에서도 이어서 볼 수 있어요.":"기록은 이 기기 안에 저장돼요."} 한자 훈음은 한국어문회 급수 한자표, 읽기와 학년·JLPT 정보는 kanji-data를 바탕으로 해요.</p>
   </div>`;
 }
 
@@ -1003,13 +1145,16 @@ Reply with only one JSON object mapping each category id to its array, e.g. {"tr
 
 // ---------- events ----------
 document.addEventListener("click",e=>{
-  const t=e.target.closest("[data-tab],[data-act],[data-dict],[data-kf],[data-kanji],[data-kana],[data-wc],[data-del],[data-set],[data-dir],[data-count],[data-order],[data-rate],[data-tog],[data-step],[data-delcat],[data-wp],[data-popmore],[data-extmode]");
+  const sb=e.target.closest("[data-say]");
+  if(sb){e.preventDefault();e.stopPropagation();speak(sb.dataset.say,sb);return}
+  const t=e.target.closest("[data-tab],[data-act],[data-dict],[data-kf],[data-kanji],[data-kana],[data-wc],[data-del],[data-set],[data-dir],[data-count],[data-order],[data-rate],[data-tog],[data-step],[data-delcat],[data-wp],[data-popmore],[data-extmode],[data-rate-tts]");
   if(!t)return;
   const d=t.dataset;
   if(d.tab){e.preventDefault();UI.tab=d.tab;UI.confirmDel=null;if(d.tab!=="test")UI.session=UI.session&&UI.session.i<UI.session.items.length?UI.session:null;try{localStorage.setItem("kotoba-tab",d.tab)}catch(_){}render();window.scrollTo(0,0);return}
   if(d.dict){UI.dict=d.dict;render();return}
   if(d.kf){UI.kgFilter=d.kf;UI.kShown=240;render();return}
   if(d.wp){const w=allWords().find(x=>x.id===d.wp);if(w)openWordPop(t,w);return}
+  if(d.rateTts){TTS.rate=+d.rateTts;try{localStorage.setItem("kotoba-tts-rate",d.rateTts)}catch(_){}render();speak("はじめまして");return}
   if(d.extmode){EXT.mode=d.extmode;UI.extOpen=true;render();return}
   if(d.popmore){POP.open[d.popmore]=true;renderPop();return}
   if(d.kanji){closePop();kanjiDetail(d.kanji);return}
@@ -1044,6 +1189,10 @@ document.addEventListener("click",e=>{
     case "ext-none":EXT.items.forEach(x=>x.on=false);render();break;
     case "ext-add":{const sel=EXT.items.filter(x=>x.on);const n=addWords(EXT.cat,sel,TODAY);toast(n?`단어 ${n}개를 단어장에 넣었어요.`:"모두 이미 있는 단어예요.");EXT.items=null;EXT.text="";EXT.transcript="";if(EXT.imgUrl)URL.revokeObjectURL(EXT.imgUrl);EXT.img=null;EXT.imgUrl="";render();break}
     case "gem-test":gemTest();break;
+    case "bk-export":exportBackup();break;
+    case "bk-merge":applyBackup("merge");break;
+    case "bk-replace":if(BK.confirm){BK.confirm=false;applyBackup("replace")}else{BK.confirm=true;toast("한 번 더 누르면 지금 기록이 백업으로 바뀌어요.");setTimeout(()=>BK.confirm=false,4000)}break;
+    case "bk-cancel":BK.pending=null;render();break;
   }
 });
 document.addEventListener("keydown",e=>{
@@ -1065,6 +1214,7 @@ document.addEventListener("input",e=>{
 document.addEventListener("change",e=>{
   if(e.target.id==="lvl"){settings().level=+e.target.value;save("settings")}
   if(e.target.id==="ext-cat")EXT.cat=e.target.value;
+  if(e.target.id==="bk-file"&&e.target.files&&e.target.files[0]){readBackup(e.target.files[0]);e.target.value=""}
   if((e.target.id==="ph-cam"||e.target.id==="ph-pick")&&e.target.files&&e.target.files[0])setPhoto(e.target.files[0]);
   if(e.target.dataset.xi!==undefined&&EXT.items){EXT.items[+e.target.dataset.xi].on=e.target.checked;render()}
 });
