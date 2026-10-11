@@ -396,13 +396,27 @@ async function cloudInit(){
     firebase.auth().onAuthStateChanged(u=>{
       CLOUD.user=u||null;
       if(CLOUD.unsub){CLOUD.unsub();CLOUD.unsub=null}
-      if(u)cloudListen();else CLOUD.status="";
+      if(u){cloudListen();cloudLoadGemini()}else CLOUD.status="";
       cloudRender();
     });
   }catch(e){CLOUD.err="클라우드 기능을 불러오지 못했어요. 인터넷 연결을 확인해 주세요.";}
   CLOUD.loading=false;cloudRender();
 }
 addEventListener("online",()=>{if(!CLOUD.ready)cloudInit();else if(CLOUD.user){if(!CLOUD.unsub)cloudListen();cloudPush()}});
+// The Gemini key travels in its own private document (users/{uid}/private/gemini), never in backups or the word data.
+function cloudPrivate(){return firebase.firestore().collection("users").doc(CLOUD.user.uid).collection("private").doc("gemini")}
+async function cloudSaveGemini(c){
+  if(IN_CLAUDE||!CLOUD.user||!c||!c.key)return;
+  try{await cloudPrivate().set({key:c.key,model:c.model||"",ts:Date.now()});CLOUD.keySynced=true}catch(e){}
+}
+async function cloudLoadGemini(){
+  try{
+    const d=await cloudPrivate().get();
+    const local=geminiCfg();
+    if(d.exists){const v=d.data();if(v&&v.key&&v.key!==local.key){setGeminiCfg({key:v.key,model:v.model||local.model},true);CLOUD.keySynced=true;toast("다른 기기에서 쓰던 Gemini 키를 가져왔어요.");cloudRender()}else if(v&&v.key)CLOUD.keySynced=true}
+    else if(local.key)cloudSaveGemini(local); // first device: share its key with the others
+  }catch(e){}
+}
 function cloudCol(){return firebase.firestore().collection("users").doc(CLOUD.user.uid).collection("docs")}
 function tomb(){return (S.docs.tomb||(S.docs.tomb={t:{}})).t}
 function mergeOne(id,a,b){
@@ -652,7 +666,7 @@ const IN_CLAUDE=!!(window.claude&&typeof window.claude.use==="function");
 const GKEY="kotoba-gemini";
 const GDEF="gemini-flash-latest";
 function geminiCfg(){let c={};try{c=JSON.parse(localStorage.getItem(GKEY)||"{}")}catch(e){}c=Object.assign({key:"",model:GDEF},c);if(!c.model||c.model==="gemini-2.5-flash")c.model=GDEF;return c}
-function setGeminiCfg(c){try{localStorage.setItem(GKEY,JSON.stringify(c));return true}catch(e){return false}}
+function setGeminiCfg(c,fromCloud){let ok=true;try{localStorage.setItem(GKEY,JSON.stringify(c))}catch(e){ok=false}if(!fromCloud&&typeof cloudSaveGemini==="function")cloudSaveGemini(c);return ok}
 const AI_NAME=IN_CLAUDE?"Claude":"Gemini";
 function looseJSON(t){
   try{return JSON.parse(t)}catch(e){}
@@ -1342,7 +1356,7 @@ function aiPanel(){
   return `<form class="panel stack" id="gemform"><h3>AI 엔진 · Gemini</h3>
     <div class="field"><label for="gem-key">Gemini API 키</label><input type="password" id="gem-key" autocomplete="off" placeholder="AQ.… 로 시작하는 키" value="${esc(c.key)}"></div>
     <div class="field"><label for="gem-model">모델 이름</label><input type="text" id="gem-model" value="${esc(c.model)}"></div>
-    <p class="muted small" style="margin:0">키는 Google AI Studio(aistudio.google.com)에서 무료로 받을 수 있어요. 키는 이 브라우저에만 저장되고 Google 말고는 어디에도 보내지 않아요. 모델 이름은 그대로 두면 항상 최신 Flash 모델을 써요. 특정 모델을 고정하고 싶을 때만 바꿔 주세요(예: gemini-3.8-flash).</p>
+    <p class="muted small" style="margin:0">키는 Google AI Studio(aistudio.google.com)에서 무료로 받을 수 있어요. ${CLOUD.user?(CLOUD.keySynced?"클라우드에 로그인돼 있어서 이 키가 내 다른 기기에도 자동으로 들어가요. 키는 내 계정만 읽을 수 있는 곳에 저장돼요.":"로그인돼 있어서 저장하면 내 다른 기기에도 자동으로 들어가요."):"키는 이 기기에만 저장돼요. 클라우드 동기화에 로그인하면 한 번만 넣어도 모든 기기에 들어가요."} 모델 이름은 그대로 두면 항상 최신 Flash 모델을 써요. 특정 모델을 고정하고 싶을 때만 바꿔 주세요(예: gemini-3.8-flash).</p>
     <div class="row"><button class="btn primary" type="submit">저장</button><button class="btn" type="button" data-act="gem-test" ${GTEST.busy?"disabled":""}>${GTEST.busy?"시험하는 중…":"연결 시험"}</button>${c.key?`<span class="small" style="color:var(--moegi)">키 저장됨</span>`:""}</div>
     ${GTEST.lines.length?`<div class="gen-out" style="max-height:none;color:var(--ink);user-select:text">${GTEST.lines.map(esc).join("\n")}</div>`:""}</form>`;
 }
