@@ -12,6 +12,7 @@
 <meta name="apple-mobile-web-app-title" content="ことば帳">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <style>body{margin:0}[hidden]{display:none!important}img{max-width:100%}</style>
+<script src="cloud-config.js"></script>
 <script>if("serviceWorker" in navigator&&(location.protocol==="https:"||location.hostname==="localhost"))addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));</script>
 </head><body>
 <title>코토바 노트</title>
@@ -310,6 +311,7 @@ addEventListener("pagehide",()=>{if(IDB.timer)flushLocal()});
 const wq={};
 function save(id){
   localSave();
+  if(!IN_CLAUDE)cloudMark(id);
   if(S.mode!=="db") return;
   const body=JSON.parse(JSON.stringify(S.docs[id]));
   wq[id]=(wq[id]||Promise.resolve()).then(()=>S.db.collection("data/users/"+S.uid).doc(id).set(body)).catch(e=>{
@@ -336,7 +338,7 @@ async function initStore(){
       }
       if(navigator.storage&&navigator.storage.estimate){const e=await navigator.storage.estimate();DEVICE.usage=e.usage}
     }catch(e){}
-    S.mode="local";S.ready=true;render();return;
+    S.mode="local";S.ready=true;render();cloudInit();return;
   }
   try{
     const [db,user]=await Promise.all([claude.use("db"),claude.use("user")]);
@@ -350,6 +352,209 @@ async function initStore(){
     } else S.mode="local";
   }catch(e){S.mode="local"}
   S.ready=true;render();
+}
+
+// ---------- cloud sync (Firebase: sign-in + Firestore), GitHub Pages app only ----------
+// Each entry of S.docs is one Firestore document at users/{uid}/docs/{id} = {j: JSON text, ts, dev}.
+// Edits are queued on the device (CLOUD.dirty, kept across restarts) and pushed when online.
+// When the same entry changed on two devices, the two versions are merged (words united, deleted words remembered in "tomb").
+const FB_VER="10.12.2";
+const CLOUD={cfg:null,loading:false,ready:false,user:null,unsub:null,dirty:new Set(),timer:null,lastSync:0,status:"",err:"",needRender:false,form:{email:"",mode:"login"}};
+const DEVICE_ID=(()=>{try{let d=localStorage.getItem("kotoba-device");if(!d){d=Math.random().toString(36).slice(2,10);localStorage.setItem("kotoba-device",d)}return d}catch(e){return "dev"+Math.random().toString(36).slice(2,8)}})();
+function cloudCfg(){
+  if(window.KOTOBA_FIREBASE&&window.KOTOBA_FIREBASE.apiKey) return {cfg:window.KOTOBA_FIREBASE,src:"file"};
+  try{const c=JSON.parse(localStorage.getItem("kotoba-firebase")||"null");if(c&&c.apiKey)return {cfg:c,src:"device"}}catch(e){}
+  return null;
+}
+function parseFirebaseConfig(text){
+  const o={};const re=/(apiKey|authDomain|projectId|storageBucket|messagingSenderId|appId|measurementId)\s*["']?\s*:\s*["']([^"']+)["']/g;let m;
+  while((m=re.exec(text)))o[m[1]]=m[2];
+  return o.apiKey&&o.projectId&&o.authDomain?o:null;
+}
+try{(JSON.parse(localStorage.getItem("kotoba-dirty")||"[]")||[]).forEach(id=>CLOUD.dirty.add(id));CLOUD.lastSync=+localStorage.getItem("kotoba-last-sync")||0}catch(e){}
+function keepDirty(){try{localStorage.setItem("kotoba-dirty",JSON.stringify([...CLOUD.dirty]))}catch(e){}}
+function cloudMark(id){
+  if(IN_CLAUDE)return;
+  CLOUD.dirty.add(id);keepDirty();
+  clearTimeout(CLOUD.timer);CLOUD.timer=setTimeout(cloudPush,1500);
+}
+function loadScript(src){return new Promise((ok,no)=>{const s=document.createElement("script");s.src=src;s.onload=ok;s.onerror=()=>no(new Error("load "+src));document.head.append(s)})}
+async function cloudInit(){
+  if(IN_CLAUDE||CLOUD.ready||CLOUD.loading)return;
+  const c=cloudCfg();if(!c)return;
+  if(navigator.onLine===false){CLOUD.status="offline";return}
+  CLOUD.loading=true;CLOUD.cfg=c;
+  try{
+    if(!window.firebase){
+      const base=`https://www.gstatic.com/firebasejs/${FB_VER}/`;
+      await loadScript(base+"firebase-app-compat.js");
+      await Promise.all([loadScript(base+"firebase-auth-compat.js"),loadScript(base+"firebase-firestore-compat.js")]);
+    }
+    if(!firebase.apps.length)firebase.initializeApp(c.cfg);
+    CLOUD.ready=true;
+    try{await firebase.auth().getRedirectResult()}catch(e){CLOUD.err=authErr(e)}
+    firebase.auth().onAuthStateChanged(u=>{
+      CLOUD.user=u||null;
+      if(CLOUD.unsub){CLOUD.unsub();CLOUD.unsub=null}
+      if(u)cloudListen();else CLOUD.status="";
+      cloudRender();
+    });
+  }catch(e){CLOUD.err="클라우드 기능을 불러오지 못했어요. 인터넷 연결을 확인해 주세요.";}
+  CLOUD.loading=false;cloudRender();
+}
+addEventListener("online",()=>{if(!CLOUD.ready)cloudInit();else if(CLOUD.user){if(!CLOUD.unsub)cloudListen();cloudPush()}});
+function cloudCol(){return firebase.firestore().collection("users").doc(CLOUD.user.uid).collection("docs")}
+function tomb(){return (S.docs.tomb||(S.docs.tomb={t:{}})).t}
+function mergeOne(id,a,b){
+  const m=mergeDocs({[id]:a},{[id]:b})[id];
+  if(id==="tomb"){const t=m.t||(m.t={});for(const [k,v] of Object.entries((a&&a.t)||{}))t[k]=Math.max(t[k]||0,v);return m}
+  const t=Object.assign({},(S.docs.tomb&&S.docs.tomb.t)||{});
+  if(id.startsWith("w-")&&m&&Array.isArray(m.words))m.words=m.words.filter(w=>!t["w:"+w.id]);
+  if(id==="settings"&&m&&Array.isArray(m.cats))m.cats=m.cats.filter(c=>!t["c:"+c.id]);
+  return m;
+}
+function cloudListen(){
+  CLOUD.status="syncing";cloudRender();
+  let first=true;
+  CLOUD.unsub=cloudCol().onSnapshot({includeMetadataChanges:false},snap=>{
+    let changed=false;
+    const seen=new Set();
+    // apply "tomb" first so merges know which words were deleted elsewhere
+    const changes=snap.docChanges().slice().sort((x,y)=>(y.doc.id==="tomb")-(x.doc.id==="tomb"));
+    for(const ch of changes){
+      const id=ch.doc.id;seen.add(id);
+      if(ch.doc.metadata&&ch.doc.metadata.hasPendingWrites)continue;
+      if(ch.type==="removed"){if(!CLOUD.dirty.has(id)&&S.docs[id]!==undefined){delete S.docs[id];changed=true}continue}
+      const d=ch.doc.data();if(!first&&d.dev===DEVICE_ID)continue;
+      let remote;try{remote=JSON.parse(d.j)}catch(e){continue}
+      if(remote===null){if(!CLOUD.dirty.has(id)&&S.docs[id]!==undefined){delete S.docs[id];changed=true}continue}
+      const local=S.docs[id];
+      let next;
+      if(local===undefined)next=remote;
+      else if(CLOUD.dirty.has(id)||first){next=mergeOne(id,local,remote);if(JSON.stringify(next)!==d.j)CLOUD.dirty.add(id)}
+      else next=remote;
+      if(JSON.stringify(next)!==JSON.stringify(local)){S.docs[id]=next;changed=true}
+    }
+    if(first){
+      // entries that exist only on this device go up to the cloud
+      for(const id of Object.keys(S.docs))if(!seen.has(id))CLOUD.dirty.add(id);
+      first=false;
+      // re-apply tombs to word lists that were merged before the tomb arrived
+      for(const id of Object.keys(S.docs))if(id.startsWith("w-")||id==="settings"){const m=mergeOne(id,S.docs[id],S.docs[id]);if(JSON.stringify(m)!==JSON.stringify(S.docs[id])){S.docs[id]=m;CLOUD.dirty.add(id);changed=true}}
+    }
+    keepDirty();
+    if(changed){flushLocal();cloudRender(true)}
+    CLOUD.status="ok";CLOUD.err="";
+    if(CLOUD.dirty.size)cloudPush();else{CLOUD.lastSync=Date.now();try{localStorage.setItem("kotoba-last-sync",String(CLOUD.lastSync))}catch(e){};cloudRender()}
+  },e=>{
+    CLOUD.unsub=null;CLOUD.status="error";
+    CLOUD.err=e&&e.code==="permission-denied"?"클라우드 저장소가 접근을 막았어요. Firebase의 Firestore 규칙을 안내대로 바꿔 주세요.":"클라우드와 연결이 끊겼어요. 잠시 뒤 다시 시도해요.";
+    cloudRender();
+    if(e&&e.code!=="permission-denied")setTimeout(()=>{if(CLOUD.user&&!CLOUD.unsub&&navigator.onLine!==false)cloudListen()},15000);
+  });
+}
+let pushing=false;
+async function cloudPush(){
+  clearTimeout(CLOUD.timer);
+  if(IN_CLAUDE||!CLOUD.user||!CLOUD.unsub||pushing||!CLOUD.dirty.size)return;
+  if(navigator.onLine===false){CLOUD.status="offline";cloudRender();return}
+  pushing=true;CLOUD.status="syncing";cloudRender();
+  const ids=[...CLOUD.dirty].slice(0,400);
+  try{
+    const db=firebase.firestore();const batch=db.batch();const col=cloudCol();const ts=Date.now();
+    for(const id of ids){
+      const v=S.docs[id];
+      const j=JSON.stringify(v===undefined?null:v);
+      if(j.length>900000){CLOUD.err=`「${id}」 기록이 너무 커서 클라우드에 올리지 못했어요.`;continue}
+      batch.set(col.doc(id),{j,ts,dev:DEVICE_ID});
+    }
+    await batch.commit();
+    ids.forEach(id=>CLOUD.dirty.delete(id));keepDirty();
+    CLOUD.lastSync=Date.now();try{localStorage.setItem("kotoba-last-sync",String(CLOUD.lastSync))}catch(e){}
+    CLOUD.status="ok";
+  }catch(e){
+    CLOUD.status="error";
+    CLOUD.err=e&&e.code==="permission-denied"?"클라우드 저장소가 저장을 막았어요. Firebase의 Firestore 규칙을 확인해 주세요.":"클라우드에 올리지 못했어요. 연결되면 다시 올려요.";
+  }
+  pushing=false;cloudRender();
+  if(CLOUD.dirty.size&&CLOUD.status==="ok")setTimeout(cloudPush,300);
+}
+function cloudRender(dataChanged){
+  const a=document.activeElement;
+  if(a&&a.matches&&a.matches("input,textarea,select")){CLOUD.needRender=true;return}
+  if(dataChanged||UI.tab==="set"||UI.tab==="home")render();
+}
+document.addEventListener("focusout",()=>{if(CLOUD.needRender){CLOUD.needRender=false;setTimeout(()=>{const a=document.activeElement;if(!(a&&a.matches&&a.matches("input,textarea,select")))render()},50)}});
+function authErr(e){
+  const c=(e&&e.code)||"";
+  return ({
+    "auth/invalid-credential":"이메일이나 비밀번호가 맞지 않아요.","auth/wrong-password":"비밀번호가 맞지 않아요.","auth/user-not-found":"가입된 이메일이 아니에요. \"처음이에요\"로 가입해 주세요.",
+    "auth/invalid-login-credentials":"이메일이나 비밀번호가 맞지 않아요.","auth/email-already-in-use":"이미 가입된 이메일이에요. 로그인해 주세요.","auth/weak-password":"비밀번호는 6자 이상으로 정해 주세요.",
+    "auth/invalid-email":"이메일 형식을 확인해 주세요.","auth/missing-password":"비밀번호를 넣어 주세요.","auth/too-many-requests":"시도가 너무 많았어요. 잠시 뒤 다시 해 주세요.",
+    "auth/network-request-failed":"인터넷에 연결되지 않았어요.","auth/popup-closed-by-user":"로그인 창이 닫혔어요.","auth/cancelled-popup-request":"로그인 창이 닫혔어요.",
+    "auth/unauthorized-domain":"이 주소는 Firebase에 등록되지 않았어요. Firebase → Authentication → 설정 → 승인된 도메인에 GitHub 주소를 넣어 주세요.",
+    "auth/operation-not-allowed":"이 로그인 방식이 꺼져 있어요. Firebase → Authentication → 로그인 방법에서 켜 주세요.",
+    "auth/configuration-not-found":"Firebase에서 Authentication을 아직 시작하지 않았어요. 안내 2단계를 확인해 주세요."
+  })[c]||("로그인하지 못했어요."+(c?` (${c})`:""));
+}
+async function cloudEmail(kind){
+  const em=(($("#cl-email")||{}).value||"").trim(),pw=(($("#cl-pw")||{}).value||"");
+  CLOUD.form.email=em;CLOUD.err="";
+  try{
+    if(kind==="reset"){if(!em){CLOUD.err="이메일을 먼저 넣어 주세요.";cloudRender();return}await firebase.auth().sendPasswordResetEmail(em);toast("비밀번호 재설정 메일을 보냈어요.");return}
+    if(kind==="signup")await firebase.auth().createUserWithEmailAndPassword(em,pw);
+    else await firebase.auth().signInWithEmailAndPassword(em,pw);
+    toast("로그인했어요. 기록을 합치는 중이에요.");
+  }catch(e){CLOUD.err=authErr(e)}
+  render();
+}
+async function cloudGoogle(){
+  CLOUD.err="";
+  const p=new firebase.auth.GoogleAuthProvider();
+  try{await firebase.auth().signInWithPopup(p);toast("로그인했어요. 기록을 합치는 중이에요.")}
+  catch(e){
+    if(e&&(e.code==="auth/popup-blocked"||e.code==="auth/operation-not-supported-in-this-environment")){try{await firebase.auth().signInWithRedirect(p);return}catch(e2){CLOUD.err=authErr(e2)}}
+    else CLOUD.err=authErr(e);
+  }
+  render();
+}
+async function cloudLogout(){
+  if(CLOUD.dirty.size&&navigator.onLine!==false)await cloudPush();
+  await firebase.auth().signOut();toast("로그아웃했어요. 이 기기의 기록은 그대로 남아요.");render();
+}
+function cloudPanel(){
+  if(IN_CLAUDE)return "";
+  const c=cloudCfg();
+  const head=`<h3>클라우드 동기화</h3>`;
+  if(!c) return `<div class="panel stack">${head}
+    <p class="small" style="margin:0">로그인해서 여러 기기에서 같은 단어장을 쓰려면 무료 Firebase 프로젝트를 한 번 만들어 연결해야 해요. 만든 뒤 나오는 설정 코드를 GitHub의 <b>cloud-config.js</b>에 넣거나, 아래 칸에 붙여 넣으세요.</p>
+    <textarea id="fb-paste" style="min-height:90px;font-family:var(--f-mono);font-size:12px" placeholder="const firebaseConfig = { apiKey: &quot;…&quot;, authDomain: &quot;…&quot;, projectId: &quot;…&quot;, … };"></textarea>
+    <div class="row"><button class="btn primary" type="button" data-act="fb-save">이 기기에 연결</button><span class="small muted">붙여 넣기는 기기마다 해야 해요. cloud-config.js에 넣으면 모든 기기에 한 번에 적용돼요.</span></div></div>`;
+  const st=CLOUD.status==="syncing"?"동기화 중…":CLOUD.status==="offline"||navigator.onLine===false?`오프라인 · 연결되면 ${CLOUD.dirty.size}개 항목을 올려요`:CLOUD.status==="error"?"동기화 오류":CLOUD.dirty.size?`올릴 항목 ${CLOUD.dirty.size}개`:"모든 기기와 맞춰져 있어요";
+  const last=CLOUD.lastSync?new Date(CLOUD.lastSync).toLocaleString("ko-KR",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"";
+  const err=CLOUD.err?`<div class="small" style="color:var(--shu)">${esc(CLOUD.err)}</div>`:"";
+  const foot=c.src==="device"?`<button class="more" type="button" data-act="fb-forget" style="background:none;border:0;color:var(--ink-soft);font-size:12px;padding:0;align-self:flex-start">이 기기의 Firebase 연결 지우기</button>`:"";
+  if(!CLOUD.ready) return `<div class="panel stack">${head}<span class="small muted">${CLOUD.loading?"클라우드 기능을 불러오는 중…":navigator.onLine===false?"오프라인이라 클라우드에 연결하지 않았어요. 기록은 이 기기에 저장되고, 연결되면 맞춰져요.":"클라우드에 연결하지 못했어요."}</span>${err}${!CLOUD.loading&&navigator.onLine!==false?`<button class="btn" type="button" data-act="cl-retry">다시 연결</button>`:""}${foot}</div>`;
+  if(CLOUD.user){
+    const u=CLOUD.user;
+    return `<div class="panel stack">${head}
+      <div class="row" style="justify-content:space-between"><div style="min-width:0"><b>${esc(u.email||u.displayName||"로그인됨")}</b><div class="small muted">${esc(st)}${last?` · 마지막 동기화 ${esc(last)}`:""}</div></div>
+      <span class="tag" style="background:${CLOUD.status==="error"?"var(--shu-wash)":"var(--moegi-wash)"};color:${CLOUD.status==="error"?"var(--shu)":"var(--moegi)"}">${CLOUD.status==="error"?"오류":"켜짐"}</span></div>
+      ${err}
+      <p class="small muted" style="margin:0">다른 기기에서도 같은 계정으로 로그인하면 단어장, 학습 기록, 분야 설정이 자동으로 맞춰져요. 인터넷이 없을 때 고친 내용은 연결되면 올라가요.</p>
+      <div class="row"><button class="btn" type="button" data-act="cl-sync">지금 동기화</button><button class="btn" type="button" data-act="cl-logout">로그아웃</button></div>${foot}</div>`;
+  }
+  const signup=CLOUD.form.mode==="signup";
+  return `<form class="panel stack" id="cl-form">${head}
+    <p class="small" style="margin:0">로그인하면 이 기기의 기록과 클라우드 기록이 합쳐져서, 같은 계정으로 로그인한 모든 기기에서 똑같이 보여요.</p>
+    <button class="btn" type="button" data-act="cl-google" style="display:flex;align-items:center;justify-content:center;gap:8px"><b style="font-family:var(--f-mono)">G</b> Google 계정으로 로그인</button>
+    <div class="row" style="gap:6px"><span style="flex:1;border-top:1px solid var(--line)"></span><span class="small muted">또는 이메일</span><span style="flex:1;border-top:1px solid var(--line)"></span></div>
+    <div class="field"><label for="cl-email">이메일</label><input type="text" id="cl-email" inputmode="email" autocomplete="email" value="${esc(CLOUD.form.email)}"></div>
+    <div class="field"><label for="cl-pw">비밀번호${signup?" (6자 이상)":""}</label><input type="password" id="cl-pw" autocomplete="${signup?"new-password":"current-password"}"></div>
+    ${err}
+    <div class="row"><button class="btn primary" type="submit" style="flex:1">${signup?"가입하고 로그인":"로그인"}</button><button class="btn" type="button" data-act="cl-mode">${signup?"이미 가입했어요":"처음이에요"}</button></div>
+    ${signup?"":`<button class="more" type="button" data-act="cl-reset" style="background:none;border:0;color:var(--ai);font-size:12px;padding:0;align-self:flex-start">비밀번호를 잊었어요</button>`}
+    <p class="small muted" style="margin:0">홈 화면 앱에서 Google 로그인이 안 되면 이메일로 로그인해 주세요.</p>${foot}</form>`;
 }
 
 // ---------- backup file ----------
@@ -392,6 +597,7 @@ function mergeDocs(cur,inc){
     else if(k==="progress"){const p=out[k].p||(out[k].p={});for(const [key,v] of Object.entries(d.p||{}))if(!p[key]||v[0]>p[key][0])p[key]=v}
     else if(k==="stats"){const s=out[k].days||(out[k].days={});for(const [day,n] of Object.entries(d.days||{}))s[day]=Math.max(s[day]||0,n)}
     else if(k==="settings"){const ids=new Set(out[k].cats.map(c=>c.id));for(const c of d.cats||[])if(!ids.has(c.id))out[k].cats.push(c)}
+    else if(k==="tomb"){const t=out[k].t||(out[k].t={});for(const [key,v] of Object.entries(d.t||{}))t[key]=Math.max(t[key]||0,v)}
   }
   return out;
 }
@@ -437,7 +643,7 @@ function addWords(catId,list,date){
   save(docId);return n;
 }
 function deleteWord(id){
-  for(const [k,d] of Object.entries(S.docs)) if(k.startsWith("w-")&&d.words){const i=d.words.findIndex(w=>w.id===id);if(i>=0){d.words.splice(i,1);save(k);delete progress()["w:"+id];saveProgressSoon();return}}
+  for(const [k,d] of Object.entries(S.docs)) if(k.startsWith("w-")&&d.words){const i=d.words.findIndex(w=>w.id===id);if(i>=0){d.words.splice(i,1);save(k);tomb()["w:"+id]=Date.now();save("tomb");delete progress()["w:"+id];saveProgressSoon();return}}
 }
 const catName=id=>(settings().cats.find(c=>c.id===id)||{name:id==="mytext"?"내 글에서":id}).name;
 
@@ -1123,6 +1329,7 @@ function viewSet(){
       <input type="text" id="ac-name" placeholder="예: 귀멸의 칼날 / YOASOBI「アイドル」/ 병원" required style="flex:1 1 200px"></div>
       <button class="btn primary" type="submit">추가</button></form>
     ${aiPanel()}
+    ${cloudPanel()}
     ${backupPanel()}
     <p class="muted small">${S.mode==="db"?"모든 기록은 내 Claude 계정에 저장돼서 다른 기기에서도 이어서 볼 수 있어요.":"기록은 이 기기 안에 저장돼요."} 한자 훈음은 한국어문회 급수 한자표, 읽기와 학년·JLPT 정보는 kanji-data를 바탕으로 해요.</p>
   </div>`;
@@ -1186,7 +1393,7 @@ document.addEventListener("click",e=>{
   if(d.kana){kanaDetail(d.kana,d.kind);return}
   if(d.wc){UI.wCat=d.wc;render();return}
   if(d.del){if(UI.confirmDel===d.del){deleteWord(d.del);UI.confirmDel=null;toast("삭제했어요.")}else UI.confirmDel=d.del;render();return}
-  if(d.delcat){const st=settings();if(UI.confirmDel===d.delcat){st.cats=st.cats.filter(c=>c.id!==d.delcat);UI.confirmDel=null;save("settings")}else UI.confirmDel=d.delcat;render();return}
+  if(d.delcat){const st=settings();if(UI.confirmDel===d.delcat){st.cats=st.cats.filter(c=>c.id!==d.delcat);tomb()["c:"+d.delcat]=Date.now();save("tomb");UI.confirmDel=null;save("settings")}else UI.confirmDel=d.delcat;render();return}
   if(d.set){UI.sel.has(d.set)?UI.sel.delete(d.set):UI.sel.add(d.set);render();return}
   if(d.dir){UI.dir=d.dir;render();return}
   if(d.count!==undefined){UI.count=+d.count;render();return}
@@ -1218,6 +1425,14 @@ document.addEventListener("click",e=>{
     case "ext-add":{const sel=EXT.items.filter(x=>x.on);const n=addWords(EXT.cat,sel,TODAY);toast(n?`「${catName(EXT.cat)}」에 단어 ${n}개를 넣었어요.`:"모두 이 분야에 이미 있는 단어예요.");if(n)UI.wCat=EXT.cat;EXT.items=null;EXT.text="";EXT.transcript="";if(EXT.imgUrl)URL.revokeObjectURL(EXT.imgUrl);EXT.img=null;EXT.imgUrl="";render();break}
     case "gem-test":gemTest();break;
     case "bk-export":exportBackup();break;
+    case "cl-google":cloudGoogle();break;
+    case "cl-mode":CLOUD.form.email=(($("#cl-email")||{}).value||"").trim();CLOUD.form.mode=CLOUD.form.mode==="signup"?"login":"signup";CLOUD.err="";render();break;
+    case "cl-reset":cloudEmail("reset");break;
+    case "cl-logout":cloudLogout();break;
+    case "cl-sync":CLOUD.err="";if(!CLOUD.unsub)cloudListen();else cloudPush();toast("동기화하는 중이에요.");break;
+    case "cl-retry":CLOUD.err="";cloudInit();render();break;
+    case "fb-save":{const c=parseFirebaseConfig(($("#fb-paste")||{}).value||"");if(!c){toast("설정 코드에서 apiKey, authDomain, projectId를 찾지 못했어요. Firebase에서 복사한 코드를 그대로 붙여 넣어 주세요.");break}try{localStorage.setItem("kotoba-firebase",JSON.stringify(c))}catch(_){}toast("Firebase에 연결하는 중이에요.");cloudInit().then(render);render();break}
+    case "fb-forget":try{localStorage.removeItem("kotoba-firebase")}catch(_){}toast("연결을 지웠어요. 앱을 다시 열면 적용돼요.");break;
     case "bk-merge":applyBackup("merge");break;
     case "bk-replace":if(BK.confirm){BK.confirm=false;applyBackup("replace")}else{BK.confirm=true;toast("한 번 더 누르면 지금 기록이 백업으로 바뀌어요.");setTimeout(()=>BK.confirm=false,4000)}break;
     case "bk-cancel":BK.pending=null;render();break;
@@ -1256,6 +1471,7 @@ document.addEventListener("submit",e=>{
     const w=$("#aw-w").value.trim(),r=$("#aw-r").value.trim(),m=$("#aw-m").value.trim(),c=$("#aw-c").value;
     if(!w||!m)return;const n=addWords(c,[{w,r,m}],TODAY);toast(n?"추가했어요.":"이미 있는 단어예요.");render();
   }
+  if(e.target.id==="cl-form"){cloudEmail(CLOUD.form.mode==="signup"?"signup":"login");return}
   if(e.target.id==="gemform"){toast(setGeminiCfg(readGemForm())?"저장했어요.":"이 브라우저에서는 키를 저장할 수 없어요.");render();return}
   if(e.target.id==="addcat"){
     const name=$("#ac-name").value.trim(),kind=$("#ac-kind").value;if(!name)return;
