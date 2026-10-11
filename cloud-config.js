@@ -12,4 +12,11 @@
 //   appId: "1:1234567890:web:abcdef"
 // };
 
-window.KOTOBA_FIREBASE = null;
+window.KOTOBA_FIREBASE = {
+  apiKey: "AIzaSyBhBULQ7zGvd_5vm9tmJi6_ETe5-rJHD58",
+  authDomain: "kotoba-note-b6964.firebaseapp.com",
+  projectId: "kotoba-note-b6964",
+  storageBucket: "kotoba-note-b6964.firebasestorage.app",
+  messagingSenderId: "184141836229",
+  appId: "1:184141836229:web:0a015209b648bc74fba5ac"
+};
